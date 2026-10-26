@@ -1,0 +1,77 @@
+using ReeLib.InternalAttributes;
+
+namespace ReeLib.Mcol
+{
+    [RszGenerate, RszAutoReadWrite, RszAssignVersion, RszVersionedObject(typeof(int))]
+    public partial class Header : BaseModel
+    {
+        public uint magic = McolFile.Magic;
+        public uint bvhSize;
+        [RszPaddingAfter(4)]
+        public int stringCount;
+        [RszVersion(3), RszPaddingAfter(8)]
+        public long stringTableOffset;
+    }
+}
+
+namespace ReeLib
+{
+    using ReeLib.Mcol;
+
+    public class McolFile : BaseFile
+    {
+        public readonly Header Header = new();
+        public BvhData? bvh;
+        public readonly List<string> stringTable = new();
+
+        public const uint Magic = 0x4C4F434D;
+
+        public McolFile(FileHandler fileHandler) : base(fileHandler)
+        {
+        }
+
+        protected override bool DoRead()
+        {
+            var handler = FileHandler;
+            Header.Read(handler);
+            bvh = new BvhData(handler.WithOffset(handler.Tell())) { Embedded = true };
+            if (handler.Position == handler.FileSize()) return true;
+
+            bvh.Read();
+
+            handler.Seek(Header.stringTableOffset);
+            for (int i = 0; i < Header.stringCount * 2; ++i) {
+                var offset = handler.ReadInt64();
+                if (offset == 0) {
+                    stringTable.Add("");
+                } else {
+                    stringTable.Add(handler.ReadWString(offset));
+                }
+            }
+            return true;
+        }
+
+        protected override bool DoWrite()
+        {
+            var handler = FileHandler;
+            Header.Write(handler);
+            Header.stringCount = bvh?.stringTable.Count ?? 0;
+            var bvhStart = handler.Tell();
+            if (bvh != null) {
+                bvh.WriteTo(handler.WithOffset(bvhStart), false);
+                Header.bvhSize = (uint)bvh.Size;
+            }
+
+            Header.stringTableOffset = handler.Tell();
+            // write the bvh string table again, because apparently mcol does that
+            if (bvh != null && handler.FileVersion > 2) {
+                bvh.FileHandler = handler;
+                bvh.WriteBvhStringTable();
+            }
+            handler.Seek(0);
+            Header.Write(handler);
+
+            return true;
+        }
+    }
+}

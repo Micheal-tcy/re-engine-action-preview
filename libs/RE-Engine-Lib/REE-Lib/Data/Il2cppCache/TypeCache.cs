@@ -1,0 +1,374 @@
+namespace ReeLib.Il2cpp;
+
+using System;
+using System.Text.Json;
+using ReeLib.Common;
+
+internal sealed class TypeCacheData
+{
+    public static readonly int CurrentCacheVersion = 2;
+
+    public int CacheVersion { get; set; }
+    public Dictionary<string, EnumCacheEntry> Enums { get; set; } = new();
+    public Dictionary<string, List<string>> Subclasses { get; set; } = new();
+}
+
+public class EnumCacheEntry
+{
+    public bool IsFlags { get; set; }
+    public string BackingType { get; set; } = string.Empty;
+    public IEnumerable<EnumCacheItem> Items { get; set; } = Array.Empty<EnumCacheItem>();
+}
+
+public class TypePatch
+{
+    public bool IsFlagEnum { get; set; }
+}
+
+public record EnumCacheItem(string name, JsonElement value);
+
+public class TypeCache
+{
+    public readonly Dictionary<string, EnumDescriptor> enums = new();
+    public Dictionary<string, List<string>> subclasses = new();
+    public Dictionary<string, string[]> parentClasses = new();
+    private HashSet<string>? _componentTypes;
+
+    private static Dictionary<string, Func<EnumDescriptor>> descriptorFactory = new();
+
+    private static readonly HashSet<string> ignoredBaseTypes = new() {
+        "System.Object", "System.ValueType", "System.MulticastDelegate", "System.Delegate", "System.Array"
+    };
+
+    public class EnumsInternalMetadata
+    {
+        public bool IsConfirmedFlags { get; set; }
+        public Dictionary<string, JsonElement> Entries { get; } = new();
+    }
+
+    public static Dictionary<string, EnumsInternalMetadata> ParseEnumsInternal(string filepath)
+    {
+        var data = new Dictionary<string, EnumsInternalMetadata>();
+        EnumsInternalMetadata? currentEnum = null;
+        var lines = File.ReadAllLines(filepath);
+        string? ns = null, name = null;
+        bool nextIsFlags = false;
+        foreach (var line in lines) {
+            var trimmed = line.AsSpan().Trim();
+            if (trimmed.StartsWith("namespace ")) {
+                var end = trimmed.IndexOf('{');
+                if (end == -1) {
+                    throw new Exception("Invalid enums internal namespace at line " + line);
+                }
+                ns = trimmed[("namespace ".Length)..end].Trim().ToString().Replace("::", ".");
+            } else if (trimmed.StartsWith("enum ")) {
+                var end = trimmed.IndexOf('{');
+                if (end == -1 || string.IsNullOrEmpty(ns)) {
+                    throw new Exception("Invalid enums internal enum at line " + line);
+                }
+                name = trimmed[("enum ".Length)..end].Trim().ToString();
+                var classname = ns + "." + name;
+                if (!data.TryGetValue(classname, out currentEnum)) {
+                    data[classname] = currentEnum = new EnumsInternalMetadata() { IsConfirmedFlags = nextIsFlags };
+                    nextIsFlags = false;
+                }
+            } else if (!trimmed.StartsWith("}")) {
+                if (trimmed.StartsWith("//")) {
+                    continue;
+                }
+                var eq = trimmed.IndexOf('=');
+                if (eq == -1 || currentEnum == null) {
+                    throw new Exception("Invalid enums internal value entry at line " + line);
+                }
+
+                var label = trimmed.Slice(0, eq).Trim();
+                var comma = trimmed.IndexOf(',');
+
+                ReadOnlySpan<char> value;
+                if (comma != -1) value = trimmed[(eq + 1)..comma].Trim();
+                else value = trimmed[(eq + 1)..].Trim();
+
+                if (value.StartsWith("-")) {
+                    currentEnum.Entries[label.ToString()] = JsonSerializer.SerializeToElement(long.Parse(value));
+                } else {
+                    currentEnum.Entries[label.ToString()] = JsonSerializer.SerializeToElement(ulong.Parse(value));
+                }
+            }
+        }
+        return data;
+    }
+
+    public void ApplyIl2cppData(Il2cppDump data, Dictionary<string, EnumsInternalMetadata>? enumsInternal)
+    {
+        EnumDescriptor.EnableSafeIl2cppValueConverter(true);
+        enums.Clear();
+        foreach (var (name, enumData) in data) {
+            if (enumData.parent == null) continue;
+
+            if (enumData.parent == "System.Enum") {
+                var backing = GetEnumBackingType(enumData);
+                if (backing == null) {
+                    Log.Error("Couldn't determine enum backing type: " + name);
+                    enums[name] = EnumDescriptor<int>.Default;
+                    continue;
+                }
+
+                var descriptor = CreateEnumDescriptor(backing.FullName!);
+                if (descriptor == null) {
+                    enums[name] = EnumDescriptor<ulong>.Default;
+                    continue;
+                }
+
+                // try and use Enums_Internal.hpp for values because there's no number hacks to deal with there (much faster)
+                if (enumsInternal?.TryGetValue(name, out var internalValue) == true) {
+                    descriptor.SetupValues(internalValue);
+                } else {
+                    descriptor.ParseIl2cppData(enumData);
+                }
+                enums[name] = descriptor;
+            } else if (!name.Contains('!') && !ignoredBaseTypes.Contains(name) && !ignoredBaseTypes.Contains(enumData.parent) && !name.StartsWith("System.")) {
+                var item = enumData;
+                var parentName = name;
+
+                // save only instantiable subclasses, ignore abstract / interfaces
+                if (item.IsAbstract) continue;
+
+                do {
+                    if (item.parent == null) break;
+                    if (!subclasses.TryGetValue(item.parent, out var list)) {
+                        subclasses[item.parent] = list = new();
+                        if (!data[item.parent].IsAbstract) {
+                            // non-abstract base types should also be saved as instantiable
+                            list.Add(item.parent);
+                        }
+                    }
+
+                    list.Add(name);
+                }
+                while (data.TryGetValue(item.parent, out item) && item.parent != null && !ignoredBaseTypes.Contains(item.parent));
+            }
+        }
+        EnumDescriptor.EnableSafeIl2cppValueConverter(false);
+    }
+
+    public bool ApplyPatches(Dictionary<string, TypePatch> patches)
+    {
+        var changed = false;
+        foreach (var (cls, patch) in patches) {
+            if (patch.IsFlagEnum && enums.TryGetValue(cls, out var enumDesc) && !enumDesc.IsFlags) {
+                enumDesc.IsFlags = true;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    public bool IsComponent(string classname)
+    {
+        _componentTypes ??= GetSubclasses("via.Component").ToHashSet();
+        return _componentTypes.Contains(classname);
+    }
+
+    public List<string> GetSubclasses(string baseclass)
+    {
+        if (subclasses.TryGetValue(baseclass, out var list)) {
+            return list;
+        }
+
+        return subclasses[baseclass] = new List<string>() { baseclass };
+    }
+
+    /// <summary>
+    /// Get all parent classes of the given classname in no particular order.
+    /// </summary>
+    public string[] GetParentClasses(string classname)
+    {
+        if (parentClasses.TryGetValue(classname, out var classes)) {
+            return classes;
+        }
+
+        var list = new List<string>();
+        foreach (var (cls, subs) in subclasses) {
+            if (cls == classname || !subs.Contains(classname)) continue;
+
+            list.Add(cls);
+        }
+
+        return parentClasses[classname] = list.ToArray();
+    }
+
+    public bool IsAssignableTo(string classname, string baseClassname)
+    {
+        return classname == baseClassname || GetSubclasses(baseClassname).Contains(classname);
+    }
+
+    public EnumDescriptor GetEnumDescriptor(string classname, RszFieldType fallbackType = RszFieldType.S32)
+    {
+        if (enums.TryGetValue(classname, out var descriptor)) {
+            return descriptor;
+        }
+
+        return fallbackType switch {
+            RszFieldType.U32 => EnumDescriptor<uint>.Default,
+            RszFieldType.S32 => EnumDescriptor<int>.Default,
+            RszFieldType.U64 => EnumDescriptor<ulong>.Default,
+            RszFieldType.S64 => EnumDescriptor<long>.Default,
+            RszFieldType.U16 => EnumDescriptor<ushort>.Default,
+            RszFieldType.S16 => EnumDescriptor<short>.Default,
+            RszFieldType.U8 => EnumDescriptor<byte>.Default,
+            RszFieldType.S8 => EnumDescriptor<sbyte>.Default,
+            _ => EnumDescriptor<int>.Default,
+        };
+    }
+
+    internal void ApplyCacheData(TypeCacheData data)
+    {
+        foreach (var (enumName, enumItem) in data.Enums) {
+            if (!enums.TryGetValue(enumName, out var enumInstance)) {
+                var descriptor = CreateEnumDescriptor(enumItem.BackingType);
+                if (descriptor != null) {
+                    descriptor.ParseCacheData(enumItem.Items);
+                    descriptor.IsFlags = enumItem.IsFlags;
+                }
+                enums[enumName] = descriptor ?? EnumDescriptor<ulong>.Default;
+            }
+        }
+        subclasses = data.Subclasses;
+    }
+
+    internal TypeCacheData ToCacheData()
+    {
+        var data = new TypeCacheData() { CacheVersion = TypeCacheData.CurrentCacheVersion };
+        foreach (var (name, entry) in enums) {
+            var cacheEntry = new EnumCacheEntry();
+            cacheEntry.BackingType = entry.BackingType.FullName!;
+            cacheEntry.Items = entry.CacheItems;
+            cacheEntry.IsFlags = entry.IsFlags;
+            data.Enums.Add(name, cacheEntry);
+        }
+        data.Subclasses = subclasses;
+        return data;
+    }
+
+    private static Type? GetEnumBackingType(ObjectDef item)
+    {
+        if (item.fields == null) {
+            return null;
+        }
+
+        foreach (var (fieldName, field) in item.fields) {
+            if (fieldName == "value__") { // !IsStatic instead?
+                return Type.GetType(field.Type);
+            }
+        }
+
+        return typeof(int);
+    }
+
+    public EnumDescriptor? CreateEnum(string name, string backingType)
+    {
+        if (enums.TryGetValue(name, out var existing)) {
+            return existing;
+        }
+
+        var desc = CreateEnumDescriptor(backingType);
+        if (desc == null) return null;
+
+        desc.IsCustom = true;
+        return enums[name] = desc;
+    }
+
+    private static EnumDescriptor? CreateEnumDescriptor(string backing)
+    {
+        if (!descriptorFactory.TryGetValue(backing, out var factory)) {
+            var t = Type.GetType(backing);
+            if (t == null) {
+                Log.Error("Invalid cached enum backing type: " + backing);
+                return null;
+            }
+
+            var enumType = typeof(EnumDescriptor<>).MakeGenericType(t!);
+            descriptorFactory[backing] = factory = () => (EnumDescriptor)Activator.CreateInstance(enumType)!;
+        }
+
+        return factory();
+    }
+
+    private static readonly Dictionary<string, KnownFileFormats> resourceNameEnumMap = new() {
+        { "RenderTargetTexture", KnownFileFormats.RenderTexture },
+        { "FSMv2Tree", KnownFileFormats.Fsm2 },
+        { "AIMapBase", KnownFileFormats.AIMap },
+        { "AIMapNavMesh", KnownFileFormats.AIMap },
+        { "AIMapWaypoint", KnownFileFormats.AIMap },
+        { "AIMapWaypointSectionManager", KnownFileFormats.AIMap },
+        { "AIMapVolumeSpace", KnownFileFormats.AIMap },
+        { "Mixer", KnownFileFormats.AudioMixer },
+        { "Definition", KnownFileFormats.DynamicsDefinition },
+        { "Bank", KnownFileFormats.SoundBank },
+        { "Package", KnownFileFormats.SoundPackage },
+        { "SparseShadowTree", KnownFileFormats.SparseShadowTree },
+    };
+    private static readonly int initialResourceNameMapsCount = resourceNameEnumMap.Count;
+
+    private static readonly Dictionary<KnownFileFormats, string> formatToResourceHolderMap = new();
+
+    public static KnownFileFormats GetResourceFormat(string classname)
+    {
+        if (classname.EndsWith("ResourceHolder")) {
+            if (resourceNameEnumMap.Count == initialResourceNameMapsCount) {
+                SetupResourceHolderMapping();
+            }
+            var cls = classname[(classname.LastIndexOf('.') + 1)..^("ResourceHolder".Length)];
+            if (resourceNameEnumMap.TryGetValue(cls, out var fmt)) {
+                return fmt;
+            }
+        } else if (classname.EndsWith("Holder")) {
+            if (resourceNameEnumMap.Count == initialResourceNameMapsCount) {
+                SetupResourceHolderMapping();
+            }
+            var cls = classname[(classname.LastIndexOf('.') + 1)..^("Holder".Length)];
+            if (resourceNameEnumMap.TryGetValue(cls, out var fmt)) {
+                return fmt;
+            }
+        }
+        return KnownFileFormats.Unknown;
+    }
+
+    public static string? GetResourceHolderClassname(KnownFileFormats format)
+    {
+        if (format == KnownFileFormats.Unknown) return null;
+
+        if (resourceNameEnumMap.Count == initialResourceNameMapsCount) {
+            SetupResourceHolderMapping();
+        }
+        return null;
+    }
+
+    private static void SetupResourceHolderMapping()
+    {
+        lock (resourceNameEnumMap) {
+            var used = resourceNameEnumMap.Values.ToHashSet();
+            if (resourceNameEnumMap.Count == initialResourceNameMapsCount) {
+                foreach (var val in Enum.GetValues<KnownFileFormats>()) {
+                    if (val == KnownFileFormats.Unknown || used.Contains(val)) continue;
+
+                    var name = ((KnownFileFormats)val).ToString();
+                    resourceNameEnumMap[name] = val;
+                    formatToResourceHolderMap[val] = name;
+                }
+            } else Thread.Sleep(10);
+        }
+    }
+
+    public KnownFileFormats[] GetResourceSubtypes(KnownFileFormats format)
+    {
+        return format switch {
+            KnownFileFormats.MotionBase => [ KnownFileFormats.Motion, KnownFileFormats.MotionTree, KnownFileFormats.MotionList, KnownFileFormats.GpuMotionList, KnownFileFormats.MotionCamera, KnownFileFormats.MotionCameraList ],
+            KnownFileFormats.TimelineBase => [ KnownFileFormats.Timeline, KnownFileFormats.Clip ],
+            KnownFileFormats.DynamicsBase => [ KnownFileFormats.RigidBodyMesh, KnownFileFormats.HeightField ],
+            KnownFileFormats.BehaviorTreeBase => [ KnownFileFormats.BehaviorTree, KnownFileFormats.Fsm2 ],
+            _ => []
+        };
+    }
+}
+

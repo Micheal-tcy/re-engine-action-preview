@@ -1,0 +1,32 @@
+﻿<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="ReExtractor.Gui.SettingsWindow"
+        Icon="/Assets/AppIcon.ico"
+        Title="设置" Width="720" Height="300" CanResize="False"
+        WindowStartupLocation="CenterOwner" Background="#16191f">
+  <Grid RowDefinitions="Auto,Auto,Auto,*,Auto" ColumnDefinitions="Auto,*,Auto" Margin="20">
+    <TextBlock Grid.Row="0" Grid.ColumnSpan="3" Text="工具设置" FontSize="20" FontWeight="SemiBold" Margin="0,0,0,18"/>
+
+    <TextBlock Grid.Row="1" Grid.Column="0" Text="Blender 程序" VerticalAlignment="Center" Margin="0,0,10,10"/>
+    <TextBox Grid.Row="1" Grid.Column="1" x:Name="BlenderPathBox" Margin="0,0,8,10"/>
+    <StackPanel Grid.Row="1" Grid.Column="2" Orientation="Horizontal" Spacing="6" Margin="0,0,0,10">
+      <Button Content="自动搜索" Click="OnDetectBlenderClicked"/>
+      <Button Content="选择…" Click="OnSelectBlenderClicked"/>
+    </StackPanel>
+
+    <TextBlock Grid.Row="2" Grid.Column="0" Text="导出文件夹" VerticalAlignment="Center" Margin="0,0,10,0"/>
+    <TextBox Grid.Row="2" Grid.Column="1" x:Name="OutputDirectoryBox" Margin="0,0,8,0"/>
+    <StackPanel Grid.Row="2" Grid.Column="2" Orientation="Horizontal" Spacing="6">
+      <Button Content="选择…" Click="OnSelectOutputClicked"/>
+      <Button Content="打开" Click="OnOpenOutputClicked"/>
+    </StackPanel>
+
+    <TextBlock Grid.Row="3" Grid.Column="1" Text="默认文件保存在程序目录；可自动搜索 Blender，也可手动选择 blender.exe。"
+               Foreground="#9aa6b5" FontSize="11" Margin="0,12,0,0"/>
+
+    <StackPanel Grid.Row="4" Grid.ColumnSpan="3" Orientation="Horizontal" HorizontalAlignment="Right">
+      <Button Content="取消" Click="OnCancelClicked" Padding="16,6" Margin="0,0,8,0"/>
+      <Button Content="保存" Click="OnSaveClicked" Padding="16,6" Background="#2563a8" Foreground="White"/>
+    </StackPanel>
+  </Grid>
+</Window>

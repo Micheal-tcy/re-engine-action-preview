@@ -1,0 +1,406 @@
+namespace ReeLib;
+
+using System;
+using ReeLib.Common;
+using ReeLib.Pak;
+
+/// <summary>
+/// Provides fast entry lookup of any resources inside a set of PAK files. Can read and keep track of all PAK entries.<br/>
+/// Thread safe except for methods noted otherwise. Base class methods may not be thread safe either.
+/// </summary>
+public class CachedMemoryPakReader : PakReader, IDisposable
+{
+    private sealed record class PakEntryCache(PakFile file, PakEntry entry);
+
+    private volatile Dictionary<ulong, PakEntryCache>? cachedEntries;
+    private MemoryStream memoryStream = new();
+    public int MatchedEntryCount => cachedEntries?.Count ?? 0;
+    public IEnumerable<string> CachedPaths => cachedEntries?.Values.Where(e => e.entry.path != null).Select(e => e.entry.path!) ?? Array.Empty<string>();
+
+    public bool ContainsUnknownFiles => _unknownFiles != null || cachedEntries?.Any(kv => kv.Value.entry.path == null) == true;
+
+    private Dictionary<ulong, KnownFileFormats>? _unknownFiles;
+    private string[]? _unknownFilePaths;
+
+    public Dictionary<ulong, KnownFileFormats> UnknownFiles => _unknownFiles ??= CacheUnknownFiles();
+    public string[] UnknownFilePaths => _unknownFilePaths ??= UnknownFiles
+        .OrderBy(kv => kv.Key)
+        .Select(kv => $"{PakReader.UnknownFilePathPrefix}{kv.Key.ToString("X16")}.{FileFormatExtensions.FormatToFileExtension(kv.Value)}")
+        .ToArray();
+    public IEnumerable<ulong> UnknownPathHashes => cachedEntries?.Values.Where(e => string.IsNullOrEmpty(e.entry.path)).Select(e => e.entry.CombinedHash).ToArray() ?? [];
+
+    private Dictionary<ulong, KnownFileFormats> CacheUnknownFiles()
+    {
+        var list = new Dictionary<ulong, KnownFileFormats>();
+        if (cachedEntries == null) return list;
+        foreach (var e in cachedEntries)
+        {
+            if (e.Value.entry.path != null) continue;
+
+            var hash = e.Value.entry.CombinedHash;
+            try {
+                var file = GetFile(hash);
+                if (file != null)
+                {
+                    if (file.Length >= 4)
+                    {
+                        uint magic1 = 0;
+                        file.Read(MemoryUtils.StructureAsBytes(ref magic1));
+                        var fmt = GuessFileFormatFromMagic(magic1);
+                        if (fmt != KnownFileFormats.Unknown)
+                        {
+                            list[hash] = fmt;
+                            continue;
+                        }
+                    }
+
+                    if (file.Length >= 8)
+                    {
+                        uint magic2 = 0;
+                        file.Read(MemoryUtils.StructureAsBytes(ref magic2));
+                        var fmt = GuessFileFormatFromMagic(magic2);
+                        if (fmt != KnownFileFormats.Unknown)
+                        {
+                            list[hash] = fmt;
+                            continue;
+                        }
+                    }
+
+                    list[hash] = KnownFileFormats.Unknown;
+                }
+            }
+            catch (Exception)
+            {
+                // ignore
+            }
+        }
+
+        return list;
+    }
+
+    private readonly object _lock = new();
+    private const int PakCacheTimeout = 30000;
+
+    /// <summary>
+    /// Reads a file into a MemoryStream.
+    /// </summary>
+    public MemoryStream? GetFile(string filepath)
+    {
+        var hash = PakUtils.GetFilepathHash(filepath);
+        return GetFile(hash);
+    }
+
+    /// <summary>
+    /// Reads a file from a filepath formatted in the "__unknown/([a-zA-Z0-9]+)[.$]" unknown filepath pattern.
+    /// </summary>
+    public MemoryStream? GetUnknownFile(string filepath)
+    {
+        var hashMatch = UnknownFileHashPattern().Match(filepath);
+        if (hashMatch.Success && ulong.TryParse(hashMatch.Groups[1].ValueSpan, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out var hash)) {
+            return GetFile(hash);
+        }
+        return null;
+    }
+
+    public int GetSize(string filepath)
+    {
+        if (cachedEntries?.TryGetValue(PakUtils.GetFilepathHash(filepath), out var entry) == true) {
+            return (int)entry.entry.decompressedSize;
+        }
+        return 0;
+    }
+
+    /// <summary>
+    /// Reads a file into a MemoryStream.
+    /// </summary>
+    public MemoryStream? GetFile(ulong filepathHash)
+    {
+        if (cachedEntries == null)
+        {
+            CacheEntries();
+            if (cachedEntries == null) throw new Exception("Failed to generate cache of PAK entries");
+        }
+
+        if (cachedEntries.TryGetValue(filepathHash, out var entry))
+        {
+            var memoryStream = new MemoryStream();
+            using var fs = File.OpenRead(entry.file.filepath);
+            entry.file.ReadEntry(entry.entry, fs, memoryStream);
+            memoryStream.Seek(0, SeekOrigin.Begin);
+            return memoryStream;
+        }
+
+        return null;
+    }
+
+    public string? GetPakFileOfEntry(ulong filepathHash)
+    {
+        if (cachedEntries == null)
+        {
+            CacheEntries();
+            if (cachedEntries == null) throw new Exception("Failed to generate cache of PAK entries");
+        }
+
+        if (cachedEntries.TryGetValue(filepathHash, out var entry))
+        {
+            return entry.file.filepath;
+        }
+
+        return null;
+    }
+
+    public bool FileExists(string filepath) => FileExists(PakUtils.GetFilepathHash(filepath));
+    public bool FileExists(ulong filepathHash)
+    {
+        if (cachedEntries == null)
+        {
+            CacheEntries();
+            if (cachedEntries == null) throw new Exception("Failed to generate cache of PAK entries");
+        }
+
+        return cachedEntries.ContainsKey(filepathHash);
+    }
+
+    /// <summary>
+    /// Reads a file into a MemoryStream using a reused file stream.<br/>
+    /// Not thread safe.<br/><br/>
+    /// The returned stream is transient, do not hold a permanent reference to it - copy any data you need somewhere else.
+    /// </summary>
+    public MemoryStream? GetFileCached(ulong filepathHash)
+    {
+        if (cachedEntries == null)
+        {
+            CacheEntries();
+            if (cachedEntries == null) throw new Exception("Failed to generate cache of PAK entries");
+        }
+
+        if (cachedEntries.TryGetValue(filepathHash, out var entry))
+        {
+            memoryStream.Seek(0, SeekOrigin.Begin);
+            memoryStream.SetLength(0);
+            entry.file.Read(entry.entry, memoryStream);
+            memoryStream.Seek(0, SeekOrigin.Begin);
+            return memoryStream;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Scan all PAK files and cache lookup info for every file entry hash.
+    /// </summary>
+    public void CacheEntries(bool assignEntryPaths = false)
+    {
+        lock(_lock)  {
+            if (cachedEntries?.Count > 0) {
+                return;
+            }
+
+            cachedEntries = new();
+            foreach (var pak in EnumeratePaks(assignEntryPaths))
+            {
+                foreach (var entry in pak.Entries)
+                {
+                    var hash = entry.CombinedHash;
+                    if (!cachedEntries.ContainsKey(hash)) {
+                        cachedEntries.Add(hash, new PakEntryCache(pak, entry));
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Attempts to guess the current platform based on the resolved file paths.
+    /// </summary>
+    public PlatformIdentifier DeterminePlatform()
+    {
+        if (!(cachedEntries?.Count > 0)) {
+            return default;
+        }
+
+        foreach (var e in cachedEntries) {
+            if (e.Value.entry.path?.StartsWith("natives/") == true) {
+                var plat = PlatformIdentifier.FindPlatformIdentifierFromPath(e.Value.entry.path);
+                if (plat.id != Platform.Unknown) return plat;
+            }
+        }
+        return default;
+    }
+
+    /// <summary>
+    /// Creates a new reader instance based on the currently cached data. Use for access to non-thread-safe operations when you need thread safety.
+    /// Must call <see cref="CacheEntries"/> before to ensure a consistent state.
+    /// </summary>
+    public CachedMemoryPakReader Clone()
+    {
+        if (!(cachedEntries?.Count > 0))
+        {
+            throw new Exception("PAK file entry cache has not been built yet");
+        }
+
+        var reader = new CachedMemoryPakReader();
+        reader.cachedEntries = cachedEntries;
+        reader.PakFilePriority = PakFilePriority;
+        reader.Filter = Filter;
+        reader.MaxThreads = MaxThreads;
+        reader.EnableConsoleLogging = EnableConsoleLogging;
+        return reader;
+    }
+
+    /// <summary>
+    /// Clears the current pak and entry cache.
+    /// Not thread safe.
+    /// </summary>
+    public void Clear()
+    {
+        cachedEntries?.Clear();
+        searchedPaths.Clear();
+    }
+
+    public void Dispose()
+    {
+        Clear();
+        GC.SuppressFinalize(this);
+    }
+
+    internal static KnownFileFormats GuessFileFormatFromMagic(uint magic)
+    {
+        return magic switch {
+            AimapAttrFile.Magic => KnownFileFormats.AIMapAttribute,
+            CcbkFile.Magic => KnownFileFormats.CharacterColliderBank,
+            CdefFile.Magic => KnownFileFormats.CollisionDefinition,
+            CfilFile.Magic => KnownFileFormats.CollisionFilter,
+            CmatFile.Magic => KnownFileFormats.CollisionMaterial,
+            CocoFile.Magic => KnownFileFormats.CompositeCollision,
+            DefFile.Magic => KnownFileFormats.DynamicsDefinition,
+            EfxFile.Magic => KnownFileFormats.Effect,
+            FolFile.Magic => KnownFileFormats.Foliage,
+            GcfFile.Magic => KnownFileFormats.GUIConfig,
+            GmlFile.Magic => KnownFileFormats.GroundMaterialList,
+            GrndFile.Magic => KnownFileFormats.Ground,
+            GtlFile.Magic => KnownFileFormats.GroundTextureList,
+            HFFile.Magic => KnownFileFormats.HeightField,
+            CHFFile.Magic => KnownFileFormats.CollisionHeightField,
+            JmapFile.Magic => KnownFileFormats.JointMap,
+            McolFile.Magic => KnownFileFormats.CollisionMesh,
+            MdfFile.Magic => KnownFileFormats.MeshMaterial,
+            MeshFile.Magic => KnownFileFormats.Mesh,
+            MplyMeshFile.Magic => KnownFileFormats.Mesh,
+            MsgFile.Magic => KnownFileFormats.Message,
+            TerrFile.Magic => KnownFileFormats.Terrain,
+            TexFile.Magic => KnownFileFormats.Texture,
+            UvsFile.Magic => KnownFileFormats.UVSequence,
+
+            AimpFile.Magic => KnownFileFormats.AIMap,
+            BhvtFile.Magic => KnownFileFormats.BehaviorTree, // same as FSMv2
+            Tmlfsm2File.Magic => KnownFileFormats.TimelineFsm2,
+            ClipFile.Magic => KnownFileFormats.Clip, // same as tml and ucurve
+            GuiFile.Magic => KnownFileFormats.GUI,
+            MotbankFile.Magic => KnownFileFormats.MotionBank,
+            MotFile.Magic => KnownFileFormats.Motion,
+            Motfsm2File.Magic => KnownFileFormats.MotionFsm2,
+            MotlistFile.Magic => KnownFileFormats.MotionList,
+            MotTreeFile.Magic => KnownFileFormats.MotionTree,
+            MotcamFile.Magic => KnownFileFormats.MotionCamera,
+            McamlistFile.Magic => KnownFileFormats.MotionCameraList,
+            McamBankFile.Magic => KnownFileFormats.MotionCameraBank,
+            PfbFile.Magic => KnownFileFormats.Prefab,
+            RcolFile.Magic => KnownFileFormats.RequestSetCollider,
+            ScnFile.Magic => KnownFileFormats.Scene,
+            FbxSkelFile.Magic => KnownFileFormats.Skeleton,
+            UserFile.Magic => KnownFileFormats.UserData,
+            UVarFile.Magic => KnownFileFormats.UserVariables,
+            MotpackFile.Magic => KnownFileFormats.MotionPack,
+            UCurveListFile.Magic => KnownFileFormats.UserCurveList,
+            ClspFile.Magic => KnownFileFormats.CollisionShapePreset,
+            ClsmFile.Magic => KnownFileFormats.CollisionSkinningMesh,
+            ChainFile.Magic => KnownFileFormats.Chain,
+            Chain2File.Magic => KnownFileFormats.Chain2,
+            GpucFile.Magic => KnownFileFormats.GpuCloth,
+            ClrpFile.Magic => KnownFileFormats.ClothResetPose,
+            SfurFile.Magic => KnownFileFormats.ShellFur,
+            DlgFile.Magic => KnownFileFormats.Dialogue,
+            DlgcfFile.Magic => KnownFileFormats.DialogueConfig,
+            DlgListFile.Magic => KnownFileFormats.DialogueList,
+            ChainWindFile.Magic => KnownFileFormats.ChainWind,
+            PoglistFile.Magic => KnownFileFormats.PointGraphList,
+            SvgSqFile.Magic => KnownFileFormats.SVGSequence,
+            Chain2LodFile.Magic => KnownFileFormats.Chain2Lod,
+            LodFile.Magic => KnownFileFormats.Lod,
+
+
+            0x00464453 => KnownFileFormats.MasterMaterial, // same as VfxShader, Shader, CfxShader
+            0x58455452 => KnownFileFormats.RenderTexture,
+            0x4D534648 => KnownFileFormats.Fsm,
+            0x6D73666D => KnownFileFormats.MotionFsm,
+            0x4252504E => KnownFileFormats.LightProbes,
+            0x59444F42 => KnownFileFormats.RigidBodySet, // same as Ragdoll
+            0x54464453 => KnownFileFormats.SDFTexture,
+            0x204D4252 => KnownFileFormats.RigidBodyMesh,
+            0x5443504D => KnownFileFormats.MaterialPointCloud,
+            0x67727472 => KnownFileFormats.RetargetRig,
+            0x736E636A => KnownFileFormats.JointConstraints,
+            0x3267656C => KnownFileFormats.IkLeg2,
+            0x326C6B69 => KnownFileFormats.IkLookAt2,
+            0x736C6B69 => KnownFileFormats.IkLegSpine,
+            0x73626B69 => KnownFileFormats.IkBodyRig,
+            0x64686B69 => KnownFileFormats.IkHand2,
+            0x6C6D6B69 => KnownFileFormats.IkMultiBone,
+            0x32746B69 => KnownFileFormats.IkTrain2,
+            0x61646B69 => KnownFileFormats.IkDamageAction,
+            0x6B696266 => KnownFileFormats.FullBodyIKRig,
+            0x64637273 => KnownFileFormats.VibrationSource,
+            0x50415257 => KnownFileFormats.WrapDeformer,
+            0x464E4946 => KnownFileFormats.FilterInfo,
+            0x52504347 => KnownFileFormats.GUIColorPreset,
+            0x59545347 => KnownFileFormats.GUIStyleList,
+            0x00535353 => KnownFileFormats.SSSProfile,
+            0x384D5453 => KnownFileFormats.SpeedTreeMesh,
+            0x4854444D => KnownFileFormats.AlembicMesh,
+            0x4F464246 => KnownFileFormats.OutlineFont,
+            0x544C5346 => KnownFileFormats.FontSlot,
+            0x544E4649 => KnownFileFormats.IconFont,
+            0x4F49434F => KnownFileFormats.OpenColorIOConfig,
+            0x52415453 => KnownFileFormats.StarCatalogue,
+            0x70797466 => KnownFileFormats.Movie,
+            0x44484B42 => KnownFileFormats.SoundBank,
+            0x4B504B41 => KnownFileFormats.SoundPackage,
+            0x494C5356 => KnownFileFormats.VfxShaderList,
+            0x7261666C => KnownFileFormats.Lensflare,
+            0x726D6565 => KnownFileFormats.EffectEmitMask,
+            0x00534549 => KnownFileFormats.IESLight,
+            0x67636C6A => KnownFileFormats.JointLODGroup,
+            0x45445046 => KnownFileFormats.FreePolygon,
+            0x504F5350 => KnownFileFormats.PSOPatch,
+            0x21545353 => KnownFileFormats.SparseShadowTree,
+            0x54435846 => KnownFileFormats.EffectCollision,
+            0x44525453 => KnownFileFormats.Strands,
+            0x444F4C54 => KnownFileFormats.StrandsLod,
+            0x54455343 => KnownFileFormats.ColliderSet,
+            0x6C626C74 => KnownFileFormats.TimelineBlend,
+            0x00474F50 => KnownFileFormats.PointGraph,
+            0x6778656A => KnownFileFormats.JointExpressionGraph,
+            0x544C4643 => KnownFileFormats.CustomFilter,
+
+            // purely guessed formats, not in a known file list
+            0x424F4345 => KnownFileFormats.EcotopeBiome,
+            0x54504E47 => KnownFileFormats.GeneratePattern,
+
+            // TODO
+            // 0x00000000 => KnownFileFormats.GpuMotionList,
+            // 0x00006B69 => KnownFileFormats.IkTrain,
+            // 0x00006B69 => KnownFileFormats.IkLizard,
+            // 0x00006B69 => KnownFileFormats.IkWagon,
+            // 0x00000000 => KnownFileFormats.RagdollController,
+            // 0x00000000 => KnownFileFormats.MeshVertexMapping,
+            // 0x00000000 => KnownFileFormats.ZivaRT,
+            // 0x00000000 => KnownFileFormats.ZivaCombiner,
+            // 0x00000000 => KnownFileFormats.DialogueTimelineList,
+            // 0x00000000 => KnownFileFormats.HeightTexture,
+            // 0x00000000 => KnownFileFormats.OodleNetworkRuntimeData,
+
+            _ => KnownFileFormats.Unknown,
+        };
+    }
+}

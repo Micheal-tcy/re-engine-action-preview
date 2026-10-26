@@ -1,0 +1,727 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:ReExtractor.Gui"
+        x:Class="ReExtractor.Gui.MainWindow"
+        Icon="/Assets/AppIcon.ico"
+        Title="ReExtractor — RE 引擎资源工作台"
+        Width="1440" Height="860" MinWidth="1100" MinHeight="680" WindowState="Maximized"
+        KeyDown="OnMainWindowKeyDown"
+        Background="#16191f">
+
+  <Window.Styles>
+    <Style Selector="Button#FeedbackLauncher:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#348beb"/>
+      <Setter Property="Foreground" Value="White"/>
+    </Style>
+    <Style Selector="Button#FeedbackLauncher:pressed /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#185ca8"/>
+      <Setter Property="Foreground" Value="White"/>
+    </Style>
+    <Style Selector="Button.export-folder /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#454d59"/>
+      <Setter Property="Foreground" Value="White"/>
+    </Style>
+    <Style Selector="Button.export-folder:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#596779"/>
+      <Setter Property="Foreground" Value="White"/>
+    </Style>
+    <Style Selector="Button.export-folder:pressed /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#344456"/>
+      <Setter Property="Foreground" Value="White"/>
+    </Style>
+  </Window.Styles>
+
+  <Grid ColumnDefinitions="*,Auto">
+  <DockPanel Grid.Column="0" Margin="12">
+    <Border x:Name="TitleStrip" DockPanel.Dock="Top" Margin="-12,-12,-12,0" Background="#20252d"
+            BorderBrush="#303947" BorderThickness="0,0,0,1" Padding="14,8">
+      <Grid ColumnDefinitions="Auto,*">
+        <TextBlock x:Name="VersionTitleText" Grid.Column="0" Text="◆  RE Engine 资源工具" Foreground="#7fc3ff"
+                   FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center"/>
+      </Grid>
+    </Border>
+    <Menu x:Name="MainMenu" DockPanel.Dock="Top" Margin="-12,0,-12,8" Background="#1b1f26">
+      <MenuItem Header="文件">
+        <MenuItem Header="打开 PAK 文件…" Click="OnOpenPakClicked"/>
+        <MenuItem Header="加载游戏文件夹…" Click="OnSelectGameDirClicked"/>
+        <MenuItem Header="打开已解包文件夹…" Click="OnOpenExtractedFolderClicked"/>
+        <MenuItem Header="打开动作预览目录（JSON）…" Click="OnOpenQuickCatalogClicked"/>
+        <Separator/>
+        <MenuItem Header="退出" Click="OnExitClicked"/>
+      </MenuItem>
+      <MenuItem Header="资源">
+        <MenuItem Header="管理路径列表…" Click="OnManageFileListsClicked"/>
+        <MenuItem Header="重新加载文件树" Click="OnReloadFileTreeClicked"/>
+        <Separator/>
+        <MenuItem x:Name="ExtractAllMenuItem" Header="全部解包 PAK…" Click="OnExtractAllClicked"/>
+      </MenuItem>
+      <MenuItem Header="动作选择 / 高级视图" Click="OnQuickLayoutToggle"/>
+      <MenuItem Header="设置" Click="OnSettingsClicked"/>
+      <MenuItem Header="环境" Click="OnEnvironmentClicked"/>
+      <MenuItem Header="关于" Click="OnAboutClicked"/>
+      <MenuItem x:Name="FeedbackMenuItem" Header="问题反馈" Click="OnFeedbackToggleClicked"/>
+      <MenuItem Header="检查更新…" Click="OnCheckUpdatesClicked"/>
+
+    </Menu>
+
+    <!-- Fixed status bar: current state only; detailed output stays in the log panel. -->
+    <Border x:Name="StatusStrip" DockPanel.Dock="Bottom" Margin="-12,8,-12,-12" Background="#20252d"
+            BorderBrush="#303947" BorderThickness="0,1,0,0" Padding="12,6">
+      <Grid RowDefinitions="Auto,Auto">
+        <TextBlock Grid.Row="0" x:Name="ActionStatus" Text="就绪"
+                   VerticalAlignment="Center" Foreground="#9cdcfe"/>
+        <Grid Grid.Row="1" x:Name="ProgressPanel" ColumnDefinitions="*,Auto" Margin="0,6,0,0" IsVisible="False">
+          <ProgressBar Grid.Column="0" x:Name="WorkProgress" Height="5" Minimum="0" Maximum="100"
+                       IsIndeterminate="True" Foreground="#3182ce" Background="#2a3039"/>
+          <TextBlock Grid.Column="1" x:Name="ProgressText" Text="" Margin="10,-5,0,0"
+                     MinWidth="150" TextAlignment="Right" Foreground="#9aa6b5" FontSize="11"/>
+        </Grid>
+      </Grid>
+    </Border>
+
+    <!-- Main: left tree | splitter | center preview | splitter | right panel -->
+    <Grid x:Name="MainLayout" ColumnDefinitions="330,5,*,5,340" RowDefinitions="*,5,180">
+
+      <DockPanel x:Name="QuickPanel" Grid.Column="0" Grid.RowSpan="3" Margin="0,0,10,0" IsVisible="False">
+        <DockPanel.Styles>
+          <Style Selector="ComboBox">
+            <Setter Property="Height" Value="28"/>
+            <Setter Property="MinHeight" Value="28"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Padding" Value="6,1"/>
+          </Style>
+          <Style Selector="Button">
+            <Setter Property="Height" Value="30"/>
+            <Setter Property="MinHeight" Value="30"/>
+            <Setter Property="Padding" Value="6,2"/>
+          </Style>
+        </DockPanel.Styles>
+        <StackPanel DockPanel.Dock="Top" Spacing="3" Margin="0,0,0,10">
+          <TextBlock Text="资源与动作" FontSize="17" FontWeight="SemiBold" Foreground="#d9eaff" Margin="0,2,0,4"/>
+          <Grid ColumnDefinitions="*,8,1.5*" RowDefinitions="Auto,Auto">
+            <TextBlock Grid.Row="0" Grid.Column="0" Text="游戏" Foreground="#9faebe"/>
+            <TextBlock Grid.Row="0" Grid.Column="2" Text="角色 / 怪物" Foreground="#9faebe"/>
+            <ComboBox Grid.Row="1" Grid.Column="0" x:Name="QuickGameCombo" HorizontalAlignment="Stretch" SelectionChanged="OnQuickGameChanged"/>
+            <ComboBox Grid.Row="1" Grid.Column="2" x:Name="QuickSubjectCombo" HorizontalAlignment="Stretch" SelectionChanged="OnQuickSubjectChanged"/>
+          </Grid>
+          <Grid RowDefinitions="Auto,Auto">
+            <TextBlock Grid.Row="0" Text="武器 / 动作集" Foreground="#9faebe"/>
+            <ComboBox Grid.Row="1" x:Name="QuickWeaponCombo" HorizontalAlignment="Stretch" SelectionChanged="OnQuickWeaponChanged" PlaceholderText="请选择动作集"/>
+          </Grid>
+          <TextBlock x:Name="QuickModelNote" TextWrapping="Wrap" TextTrimming="CharacterEllipsis" MaxLines="2" MaxHeight="30" Foreground="#aab7c8" FontSize="11"/>
+          <Grid ColumnDefinitions="*,8,*" RowDefinitions="Auto,Auto">
+            <TextBlock Grid.Row="0" Grid.Column="0" Text="行为主类" Foreground="#9faebe"/>
+            <TextBlock Grid.Row="0" Grid.Column="2" Text="游戏子类" Foreground="#9faebe" ToolTip.Tip="子类仅来自配置或分类证据，没有配置时保留未细分。"/>
+            <ComboBox Grid.Row="1" Grid.Column="0" x:Name="QuickCategoryCombo" HorizontalAlignment="Stretch" SelectionChanged="OnQuickCategoryChanged"/>
+            <ComboBox Grid.Row="1" Grid.Column="2" x:Name="QuickSubcategoryCombo" HorizontalAlignment="Stretch" SelectionChanged="OnQuickSubcategoryChanged"/>
+          </Grid>
+          <TextBox x:Name="QuickSearch" Height="30" MinHeight="30" Padding="6,2" Watermark="搜索动作名称或编号" TextChanged="OnQuickSearchChanged"/>
+          <TextBlock x:Name="QuickCount" Text="选择动作集后显示动作" Foreground="#89baf2"/>
+        </StackPanel>
+        <StackPanel DockPanel.Dock="Bottom" Spacing="5" Margin="0,8,0,0">
+          <Expander Header="修正当前动作分类" IsExpanded="False" HorizontalAlignment="Stretch" FontSize="12">
+            <ComboBox x:Name="QuickAssignCategory" HorizontalAlignment="Stretch" PlaceholderText="为选中动作标记分类…" SelectionChanged="OnQuickAssignCategory" ToolTip.Tip="手动分类会单独保存在本机，不修改游戏资源。"/>
+          </Expander>
+          <Grid ColumnDefinitions="*,*">
+            <Button x:Name="QuickReplay" Grid.Column="0" Content="重新播放所选" Click="OnQuickReplay" HorizontalAlignment="Stretch" Margin="0,0,4,0"/>
+            <Button x:Name="QuickTextures" Grid.Column="1" Content="加载外观贴图" Click="OnQuickTextures" HorizontalAlignment="Stretch" Margin="4,0,0,0"/>
+          </Grid>
+          <ScrollViewer MaxHeight="48" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <TextBlock x:Name="QuickStatus" Text="先选择游戏与角色，再选择动作集。" TextWrapping="Wrap" Foreground="#b9cadc" FontSize="12"/>
+          </ScrollViewer>
+        </StackPanel>
+        <ListBox x:Name="QuickMotionList" SelectionChanged="OnQuickMotionChanged" Background="#1c232d"
+                 BorderBrush="#35445a" BorderThickness="1" CornerRadius="6"
+                 ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+          <ListBox.Styles>
+            <Style Selector="ListBoxItem"><Setter Property="HorizontalContentAlignment" Value="Stretch"/><Setter Property="Padding" Value="7,2"/></Style>
+          </ListBox.Styles>
+          <ListBox.ItemTemplate>
+            <DataTemplate>
+              <StackPanel Margin="3,5" Spacing="3">
+                <TextBlock Text="{Binding Display}" TextWrapping="Wrap" Foreground="#e2eaf4"/>
+                <TextBlock Text="{Binding Detail}" FontSize="11" Foreground="#89baf2" ToolTip.Tip="{Binding CategoryReason}"/>
+              </StackPanel>
+            </DataTemplate>
+          </ListBox.ItemTemplate>
+        </ListBox>
+      </DockPanel>
+
+      <!-- Left: list and PAK workflow + resource tree -->
+      <DockPanel x:Name="LeftPanel" Grid.Column="0" Grid.RowSpan="3" Margin="0,0,6,0">
+        <TextBlock DockPanel.Dock="Top" Text="路径列表 / PAK 文件" Foreground="#aab2c0"
+                   FontWeight="SemiBold" Margin="0,0,0,8"/>
+        <Border DockPanel.Dock="Top" Background="#20252d" BorderBrush="#303947" BorderThickness="1"
+                CornerRadius="6" Padding="10" Margin="0,0,0,10">
+          <StackPanel>
+            <TextBlock Text="路径列表" FontWeight="SemiBold" Margin="0,0,0,5"/>
+            <ComboBox x:Name="ManagedListCombo" SelectionChanged="OnManagedListChanged" HorizontalAlignment="Stretch" Margin="0,0,0,6">
+              <ComboBox.ItemTemplate>
+                <DataTemplate>
+                  <TextBlock Text="{Binding Title}" ToolTip.Tip="{Binding FilePath}"/>
+                </DataTemplate>
+              </ComboBox.ItemTemplate>
+            </ComboBox>
+            <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,8">
+              <Button Grid.Column="0" Content="重新加载文件树" Click="OnReloadFileTreeClicked"
+                      Background="#2563a8" Foreground="White"/>
+              <Button Grid.Column="1" Content="管理…" Click="OnManageFileListsClicked" Margin="6,0,0,0"/>
+            </Grid>
+
+            <Separator Margin="0,0,0,8"/>
+            <TextBlock Text="游戏文件夹" FontWeight="SemiBold" Margin="0,0,0,5"/>
+            <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,6">
+              <TextBox Grid.Column="0" x:Name="GameDirBox" Watermark="自动扫描目录内全部 PAK"/>
+              <Button Grid.Column="1" Content="选择…" Click="OnChooseGameDirClicked" Margin="6,0,0,0"/>
+            </Grid>
+            <Button Click="OnLoadGameDirClicked" HorizontalAlignment="Stretch" Height="64" Padding="14,10"
+                    HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                    Background="#0e72d8" Foreground="White" Margin="0,2,0,12"
+                    BorderBrush="#58a6ff" BorderThickness="1">
+              <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                <TextBlock Text="扫描并加载 PAK" FontSize="16" FontWeight="Bold" HorizontalAlignment="Center"/>
+                <TextBlock Text="从游戏文件夹开始" FontSize="11" Foreground="#d9ecff" Margin="0,3,0,0" HorizontalAlignment="Center"/>
+              </StackPanel>
+            </Button>
+            <Button Click="OnChooseResourceFolderClicked" HorizontalAlignment="Stretch"
+                    HorizontalContentAlignment="Center" VerticalContentAlignment="Center" Height="42"
+                    Background="#2a5f46" Foreground="White" Margin="0,0,0,12">
+              <TextBlock Text="打开已解包文件夹" FontWeight="SemiBold"
+                         HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Button>
+
+            <TextBlock x:Name="StatusText" Text="尚未添加 PAK" Foreground="#9cdcfe"
+                       TextWrapping="Wrap" Margin="0,0,0,0"/>
+          </StackPanel>
+        </Border>
+
+        <TextBlock DockPanel.Dock="Top" Text="资源文件" Foreground="#aab2c0" FontWeight="SemiBold" Margin="0,0,0,7"/>
+        <TextBox DockPanel.Dock="Top" x:Name="SearchBox" Watermark="模糊搜索当前资源"
+                 TextChanged="OnSearchChanged" Margin="0,0,0,6"/>
+        <Panel>
+          <TreeView x:Name="FileTree" SelectionMode="Multiple" SelectionChanged="OnTreeSelectionChanged">
+            <TreeView.Styles>
+              <Style Selector="TreeViewItem">
+                <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}"/>
+              </Style>
+            </TreeView.Styles>
+            <TreeView.ContextFlyout>
+              <MenuFlyout>
+                <MenuItem Header="添加选中模型到合并器" Click="OnCtxAddToMerge"/>
+                <MenuItem Header="批量导出选中模型 FBX" Click="OnCtxExportModels"/>
+                <MenuItem Header="添加到动画导出列表" Click="OnCtxAddToAnimBatch"/>
+                <MenuItem Header="叠加到当前预览" Click="OnCtxAddModel"/>
+                <Separator/>
+                <MenuItem Header="导出贴图 PNG" Click="OnCtxExportTextures"/>
+                <MenuItem Header="打开导出文件夹" Click="OnCtxShowExplorer"/>
+              </MenuFlyout>
+            </TreeView.ContextFlyout>
+            <TreeView.DataTemplates>
+              <TreeDataTemplate DataType="local:FileTreeNode" ItemsSource="{Binding Children}">
+                <Border Background="Transparent" HorizontalAlignment="Stretch" Padding="2,1">
+                  <TextBlock Text="{Binding Display}"/>
+                </Border>
+              </TreeDataTemplate>
+            </TreeView.DataTemplates>
+          </TreeView>
+          <ListBox x:Name="SearchResults" IsVisible="False" SelectionMode="Multiple"
+                   SelectionChanged="OnSearchSelectionChanged">
+            <ListBox.ContextFlyout>
+              <MenuFlyout>
+                <MenuItem Header="在目录树中定位" Click="OnCtxLocateInTree"/>
+                <Separator/>
+                <MenuItem Header="添加选中模型到合并器" Click="OnCtxAddToMerge"/>
+                <MenuItem Header="批量导出选中模型 FBX" Click="OnCtxExportModels"/>
+                <MenuItem Header="添加到动画导出列表" Click="OnCtxAddToAnimBatch"/>
+                <MenuItem Header="叠加到当前预览" Click="OnCtxAddModel"/>
+                <Separator/>
+                <MenuItem Header="导出选中贴图 PNG" Click="OnCtxExportTextures"/>
+                <MenuItem Header="打开导出文件夹" Click="OnCtxShowExplorer"/>
+              </MenuFlyout>
+            </ListBox.ContextFlyout>
+            <ListBox.ItemTemplate>
+              <DataTemplate>
+                <Border Background="Transparent" HorizontalAlignment="Stretch" Padding="2,1">
+                  <TextBlock Text="{Binding Path}"/>
+                </Border>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+        </Panel>
+      </DockPanel>
+
+      <GridSplitter x:Name="LeftSplitter" Grid.Column="1" Grid.RowSpan="3" Width="5" Background="#3f3f46" HorizontalAlignment="Stretch"/>
+
+      <!-- Center: preview with top toolbar + bottom playback bar -->
+      <DockPanel x:Name="CenterPreview" Grid.Column="2" Margin="6,0,6,0">
+        <TextBlock DockPanel.Dock="Top" Text="模型与动画预览" Foreground="#aab2c0" FontWeight="SemiBold" Margin="0,0,0,7"/>
+        <Border x:Name="QuickSubjectCard" DockPanel.Dock="Top" IsVisible="False"
+                Background="#1e2c3b" BorderBrush="#426582" BorderThickness="1" CornerRadius="6"
+                Padding="12,8" Margin="0,0,0,8">
+          <StackPanel Spacing="4">
+            <TextBlock x:Name="QuickSubjectTitle" FontSize="16" FontWeight="SemiBold" Foreground="#c4e1ff" TextWrapping="Wrap"/>
+            <TextBlock x:Name="QuickSubjectDescription" FontSize="13" Foreground="#d0dbe8" TextWrapping="Wrap"/>
+          </StackPanel>
+        </Border>
+        <Border DockPanel.Dock="Bottom" Background="#202a36" CornerRadius="5" Padding="10,7" Margin="0,6,0,0">
+          <StackPanel Spacing="4">
+            <WrapPanel>
+              <TextBlock Text="相机速度" Foreground="#d5e8ff" VerticalAlignment="Center" Margin="0,0,8,0"/>
+              <Slider x:Name="CameraSpeedSlider" Minimum="-4" Maximum="4" Value="0" Width="170" Height="28" VerticalAlignment="Center"
+                      ValueChanged="OnCameraSpeedChanged" ToolTip.Tip="相机移动倍率：0.0625× 至 16×；按住右键滚动滚轮也可调整"/>
+              <TextBlock x:Name="CameraSpeedText" Text="1×" MinWidth="65" Foreground="#89c8ff" VerticalAlignment="Center" Margin="8,0,0,0"/>
+              <Button Content="重置速度" Click="OnCameraSpeedReset" Height="28" MinHeight="28" Padding="8,2" FontSize="11"/>
+              <TextBlock Text="右键 + 滚轮调速" FontSize="11" Foreground="#a9c5df" VerticalAlignment="Center" Margin="12,0,0,0"/>
+            </WrapPanel>
+            <TextBlock Text="右键 + WASD 移动 · QE 升降 · Shift 加速  |  左键环绕 · 中键平移 · 滚轮缩放  |  F 取景 · 空格播放 · F11 全屏"
+                       FontSize="11" Foreground="#a9c5df" TextWrapping="Wrap"/>
+          </StackPanel>
+        </Border>
+        <!-- DCC-style viewport toolbar -->
+        <Border DockPanel.Dock="Top" Background="#20252d" BorderBrush="#394352" BorderThickness="1"
+                CornerRadius="6" Padding="8" Margin="0,0,0,6" ClipToBounds="True">
+          <StackPanel Spacing="5">
+            <WrapPanel Orientation="Horizontal">
+              <TextBlock Grid.Column="0" Text="视图" VerticalAlignment="Center" Margin="0,0,5,0"/>
+              <ComboBox Grid.Column="1" x:Name="ViewCombo" Width="105" SelectedIndex="0"
+                        SelectionChanged="OnViewportViewChanged">
+                <ComboBoxItem>透视</ComboBoxItem><ComboBoxItem>前</ComboBoxItem><ComboBoxItem>后</ComboBoxItem>
+                <ComboBoxItem>左</ComboBoxItem><ComboBoxItem>右</ComboBoxItem><ComboBoxItem>顶</ComboBoxItem><ComboBoxItem>底</ComboBoxItem>
+              </ComboBox>
+              <Button Grid.Column="2" Content="全部取景（F）" Click="OnViewportFrameAll" Margin="5,0,0,0"
+                      ToolTip.Tip="将全部模型稳定地放入视口（快捷键 F）"/>
+              <TextBlock Grid.Column="3" Text="显示" VerticalAlignment="Center" Margin="12,0,5,0"/>
+              <ComboBox Grid.Column="4" x:Name="RenderModeCombo" Width="115" SelectedIndex="0"
+                        SelectionChanged="OnViewportRenderModeChanged">
+                <ComboBoxItem>材质</ComboBoxItem><ComboBoxItem>贴图原色</ComboBoxItem><ComboBoxItem>实体</ComboBoxItem>
+                <ComboBoxItem>线框</ComboBoxItem><ComboBoxItem>材质 + 边线</ComboBoxItem>
+              </ComboBox>
+              <Button Grid.Column="5" x:Name="LoadTexturesButton" Content="加载贴图" Click="OnLoadTexturesClicked" Margin="8,0,0,0"
+                      ToolTip.Tip="默认只加载模型；需要材质贴图时再点击。右键可重新选择材质版本。">
+                <Button.ContextMenu>
+                  <ContextMenu><MenuItem Header="重新选择材质版本…" Click="OnReselectMaterialClicked"/></ContextMenu>
+                </Button.ContextMenu>
+              </Button>
+              <Button Grid.Column="6" Content="全屏（F11）" Click="OnViewportFullscreenClicked" Margin="8,0,0,0"
+                      ToolTip.Tip="隐藏工具面板并让用户视图全屏；再次按 F11 退出"/>
+              <TextBlock Grid.Column="7" x:Name="FpsText" Text="" VerticalAlignment="Center" HorizontalAlignment="Right"
+                         Margin="10,0,0,0" Foreground="#9cdcfe" TextTrimming="CharacterEllipsis"/>
+            </WrapPanel>
+            <WrapPanel Orientation="Horizontal">
+              <CheckBox Grid.Column="0" x:Name="GridCheck" Content="网格（G）" IsChecked="True"
+                        Margin="0,0,12,0" IsCheckedChanged="OnGridToggled"/>
+              <CheckBox Grid.Column="1" x:Name="AxesCheck" Content="坐标轴" IsChecked="True"
+                        Margin="0,0,12,0" IsCheckedChanged="OnAxesToggled"/>
+              <CheckBox Grid.Column="2" x:Name="SkeletonCheck" Content="显示骨骼（B）" IsChecked="False"
+                        Margin="0,0,12,0" IsCheckedChanged="OnSkeletonToggled"/>
+              <ComboBox Grid.Column="3" x:Name="LodCombo" Width="175" HorizontalAlignment="Left"
+                        SelectedIndex="0" SelectionChanged="OnLodChanged"
+                        ToolTip.Tip="预览与预览模型导出使用同一档。缺少该档时使用最后一级；切换会重新加载模型并重置动画及可见组。">
+                <ComboBoxItem>LOD0（最高精度）</ComboBoxItem><ComboBoxItem>LOD1</ComboBoxItem>
+                <ComboBoxItem>LOD2</ComboBoxItem><ComboBoxItem>LOD3</ComboBoxItem>
+                <ComboBoxItem>LOD4</ComboBoxItem><ComboBoxItem>LOD5</ComboBoxItem>
+                <ComboBoxItem>LOD6</ComboBoxItem><ComboBoxItem>LOD7</ComboBoxItem>
+              </ComboBox>
+              <TextBlock Grid.Column="4" x:Name="MotionLabel" Text="动画" VerticalAlignment="Center"
+                         Margin="12,0,5,0" IsVisible="False"/>
+              <ComboBox Grid.Column="5" x:Name="MotionCombo" Width="340" MinWidth="120" MaxWidth="480"
+                        HorizontalAlignment="Right" SelectionChanged="OnMotionChanged"
+                        IsVisible="False"/>
+            </WrapPanel>
+            <Border x:Name="BlendPreviewPanel" IsVisible="False" Margin="0,10,0,0"
+                    Padding="12" Background="#192838" BorderBrush="#36516c" BorderThickness="1" CornerRadius="6">
+              <StackPanel Spacing="8">
+                <WrapPanel>
+                  <TextBlock Text="动画轨道与分层预览" FontWeight="SemiBold" Foreground="#8fc9ff" VerticalAlignment="Center" Margin="0,0,14,6"/>
+                  <TextBlock Text="当前动画导出包含预览叠加" Foreground="#b2c4d6" FontSize="12" VerticalAlignment="Center" Margin="0,0,0,6"/>
+                </WrapPanel>
+                <WrapPanel>
+                  <TextBlock Text="配对附加层" VerticalAlignment="Center" Margin="0,0,8,6"/>
+                  <ComboBox x:Name="AdditiveMotionCombo" Width="320" MaxWidth="480" Margin="0,0,12,6" SelectionChanged="OnBlendPreviewChanged"/>
+                </WrapPanel>
+                <TextBlock x:Name="BlendPreviewDescription" TextWrapping="Wrap" Foreground="#b2c4d6" FontSize="12"/>
+                <Expander x:Name="AdvancedMotionOptions" Header="高级：原始轨道检查" IsExpanded="False" HorizontalAlignment="Stretch">
+                  <StackPanel Spacing="6" Margin="0,8,0,0">
+                    <TextBlock Text="单独查看源动作，不进行叠加。附加轨道单独播放时可能出现异常姿势。" TextWrapping="Wrap" Foreground="#edc17d" FontSize="12"/>
+                    <CheckBox x:Name="ShowRawMotionTracks" Content="单独检查原始轨道（退出组合预览）" IsCheckedChanged="OnRawMotionTracksChanged"/>
+                    <ScrollViewer MaxHeight="140">
+                      <TextBlock x:Name="RawAdditiveInventory" TextWrapping="Wrap" FontSize="12" Foreground="#b2c4d6"/>
+                    </ScrollViewer>
+                  </StackPanel>
+                </Expander>
+              </StackPanel>
+            </Border>
+          </StackPanel>
+        </Border>
+
+
+        <!-- viewport / image -->
+        <Border Background="#11151b" BorderBrush="#394352" BorderThickness="1" CornerRadius="6" ClipToBounds="True">
+          <Grid>
+            <!-- GPU OpenGL 视口：自我渲染（硬件各向异性过滤，贴图干净无混叠），自己处理输入 -->
+            <local:GlViewport x:Name="Viewport" IsVisible="True" Focusable="False"/>
+            <!-- Routed-input surface: native OpenGL surfaces do not reliably participate in
+                 Avalonia hit testing on Windows. This transparent control owns capture/focus
+                 and forwards camera gestures to the viewport. -->
+            <Border x:Name="ViewportInput" Background="Transparent" Focusable="True"
+                    Cursor="Arrow" IsVisible="True"
+                    PointerPressed="OnViewportPointerPressed"
+                    PointerMoved="OnViewportPointerMoved"
+                    PointerReleased="OnViewportPointerReleased"
+                    PointerCaptureLost="OnViewportPointerCaptureLost"
+                    PointerWheelChanged="OnViewportPointerWheelChanged"
+                    KeyDown="OnViewportKeyDown" KeyUp="OnViewportKeyUp" LostFocus="OnViewportLostFocus"/>
+            <!-- 贴图等静态图片预览（3D 模型时隐藏） -->
+            <Image x:Name="PreviewImage" Stretch="Uniform" RenderOptions.BitmapInterpolationMode="HighQuality" IsVisible="False"/>
+            <Border HorizontalAlignment="Left" VerticalAlignment="Top" Background="#B31B1D21" CornerRadius="3"
+                    Padding="8,4" Margin="8" IsHitTestVisible="False">
+              <TextBlock x:Name="ViewportLabel" Text="用户视图 · 透视 · 材质" Foreground="#e5e9ef" FontWeight="SemiBold"/>
+            </Border>
+            <Border x:Name="GridScaleLegend" HorizontalAlignment="Right" VerticalAlignment="Top" Background="#D91B2028"
+                    CornerRadius="4" Padding="10,5" Margin="8" IsHitTestVisible="False">
+              <TextBlock Text="地面刻度  ·  细格 10 cm  /  粗格 1 m" FontSize="12" Foreground="#c4ddf5"/>
+            </Border>
+            <!-- UE 风格世界坐标轴：固定在左下角，明确标识 X 侧向 / Y 前向 / Z 向上。 -->
+            <Border HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="10"
+                    Width="92" Height="92" Background="#99141920" CornerRadius="5"
+                    BorderBrush="#394352" BorderThickness="1" IsHitTestVisible="False">
+              <Canvas Width="90" Height="90">
+                <Line x:Name="WorldAxisX" StartPoint="45,58" EndPoint="17,67" Stroke="#ef4444" StrokeThickness="4"/>
+                <Line x:Name="WorldAxisY" StartPoint="45,58" EndPoint="22,50" Stroke="#35c759" StrokeThickness="4"/>
+                <Line x:Name="WorldAxisZ" StartPoint="45,58" EndPoint="45,24" Stroke="#3b82f6" StrokeThickness="4"/>
+                <Ellipse Canvas.Left="41" Canvas.Top="54" Width="8" Height="8" Fill="#e5e9ef"/>
+                <TextBlock x:Name="WorldAxisXLabel" Text="X" Canvas.Left="5" Canvas.Top="61" Foreground="#ff6868" FontWeight="Bold"/>
+                <TextBlock x:Name="WorldAxisYLabel" Text="Y" Canvas.Left="11" Canvas.Top="42" Foreground="#48df6b" FontWeight="Bold"/>
+                <TextBlock x:Name="WorldAxisZLabel" Text="Z" Canvas.Left="40" Canvas.Top="5" Foreground="#60a5fa" FontWeight="Bold"/>
+              </Canvas>
+            </Border>
+
+            <!-- 动画时间轴悬浮在用户视图内；没有已加载动画时完全隐藏。 -->
+            <Border x:Name="PlaybackOverlay" IsVisible="False"
+                    HorizontalAlignment="Stretch" VerticalAlignment="Bottom"
+                    Margin="112,0,10,10" Padding="7,6"
+                    Background="#D91B2028" BorderBrush="#536174" BorderThickness="1"
+                    CornerRadius="5">
+              <Grid ColumnDefinitions="Auto,*,Auto">
+                <Button Grid.Column="0" x:Name="PlaybackButton" Content="▶" Click="OnPlaybackClicked"
+                        Width="34" Height="30" Padding="0" Margin="0,0,8,0"
+                        HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                        ToolTip.Tip="播放"/>
+                <Slider Grid.Column="1" x:Name="TimelineSlider" VerticalAlignment="Center"
+                        Minimum="0" Maximum="1" Value="0"
+                        ValueChanged="OnTimelineScrubbed"/>
+                <TextBlock Grid.Column="2" x:Name="TimelineText" Text="" VerticalAlignment="Center"
+                           Margin="8,0,0,0" Foreground="#9cdcfe" MinWidth="110"/>
+              </Grid>
+            </Border>
+          </Grid>
+        </Border>
+      </DockPanel>
+
+      <GridSplitter x:Name="RightSplitter" Grid.Column="3" Grid.RowSpan="3" Width="5" Background="#3f3f46" HorizontalAlignment="Stretch"/>
+
+      <!-- Right: operation panels -->
+      <DockPanel x:Name="RightPanel" Grid.Column="4" Grid.RowSpan="3" Margin="6,0,0,0">
+        <!-- 模型组固定在右上方；Mac 触控板滚动下方内容时不再把它一起卷走。 -->
+        <TabControl DockPanel.Dock="Top" Margin="0,0,0,10">
+          <TabItem Header="模型组" FontSize="13" Padding="9,5">
+          <StackPanel Margin="0,8,0,0">
+          <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,7">
+            <TextBlock Grid.Column="0" Text="可见模型组" Foreground="#aab2c0" FontWeight="SemiBold"/>
+            <TextBlock Grid.Column="1" x:Name="VisconGroupSummaryText" Text="未加载"
+                       Foreground="#7f8895" FontSize="11" VerticalAlignment="Center"/>
+          </Grid>
+          <Border Background="#20252d" BorderBrush="#303947" BorderThickness="1" CornerRadius="6" Padding="10" Margin="0,0,0,12">
+            <StackPanel>
+              <TextBlock Text="勾选控制显示；单击选中后可单独显示或取景。"
+                         Foreground="#8b929c" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,7"/>
+              <ListBox x:Name="VisconGroupList" MaxHeight="220" SelectionMode="Single"
+                       SelectionChanged="OnVisconSelectionChanged"
+                       Background="#171b21" BorderBrush="#303947" BorderThickness="1"
+                       ScrollViewer.VerticalScrollBarVisibility="Auto"
+                       ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                <ListBox.Styles>
+                  <Style Selector="ListBoxItem">
+                    <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                  </Style>
+                </ListBox.Styles>
+                <ListBox.ItemTemplate>
+                  <DataTemplate>
+                    <Border ToolTip.Tip="{Binding MaterialTip}" Margin="2,1" Padding="4,3"
+                            Background="Transparent" HorizontalAlignment="Stretch">
+                      <Grid ColumnDefinitions="Auto,*">
+                        <!-- Keep the visibility toggle hit target limited to the box itself.
+                             Clicking the label/row only selects the ListBoxItem. -->
+                        <CheckBox Grid.Column="0" IsChecked="{Binding IsVisible, Mode=OneWay}"
+                                  Tag="{Binding Key}" Click="OnVisconGroupClicked"
+                                  VerticalAlignment="Center" HorizontalAlignment="Left"/>
+                        <TextBlock Grid.Column="1" Text="{Binding Display}" Margin="7,0,0,0"
+                                   VerticalAlignment="Center" IsHitTestVisible="False"/>
+                      </Grid>
+                    </Border>
+                  </DataTemplate>
+                </ListBox.ItemTemplate>
+              </ListBox>
+              <Grid ColumnDefinitions="*,*,*" ColumnSpacing="6" Margin="0,7,0,6">
+                <Button Grid.Column="0" Content="恢复默认" Click="OnVisconReset"
+                        HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="6,5"/>
+                <Button Grid.Column="1" Content="全部显示" Click="OnVisconShowAll"
+                        HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="6,5"
+                        ToolTip.Tip="替代壳可能互相覆盖"/>
+                <Button Grid.Column="2" Content="全部隐藏" Click="OnVisconHideAll"
+                        HorizontalAlignment="Stretch" HorizontalContentAlignment="Center" Padding="6,5"/>
+              </Grid>
+              <Grid ColumnDefinitions="*,*" ColumnSpacing="6">
+                <Button Grid.Column="0" Content="仅显示选中组" Click="OnVisconIsolate"
+                        Background="#205b86" Foreground="White" Padding="7,6"
+                        HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                        ToolTip.Tip="隐藏其他模型组，只保留当前选中组"/>
+                <Button Grid.Column="1" Content="取景选中（Z）" Click="OnVisconFrameSelected"
+                        Padding="7,6" HorizontalAlignment="Stretch" HorizontalContentAlignment="Center"
+                        ToolTip.Tip="保持其他组可见，只将镜头对准选中组"/>
+              </Grid>
+            </StackPanel>
+          </Border>
+          </StackPanel>
+          </TabItem>
+
+          <TabItem Header="骨骼树" FontSize="13" Padding="9,5">
+            <StackPanel Margin="0,8,0,0">
+              <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,6">
+                <TextBlock Grid.Column="0" Text="导出骨骼层级" Foreground="#aab2c0" FontWeight="SemiBold"/>
+                <TextBlock Grid.Column="1" x:Name="BoneTreeSummaryText" Text="未加载"
+                           Foreground="#7f8895" FontSize="11" VerticalAlignment="Center"/>
+              </Grid>
+              <TextBox x:Name="BoneSearchBox" Watermark="搜索骨骼名称"
+                       TextChanged="OnBoneSearchChanged" Margin="0,0,0,6"
+                       FontSize="12" Padding="7,5"/>
+              <Border Background="#171b21" BorderBrush="#303947" BorderThickness="1"
+                      CornerRadius="4" Margin="0,0,0,7">
+                <TreeView x:Name="BoneTree" Height="260" SelectionMode="Single"
+                          SelectionChanged="OnBoneTreeSelectionChanged"
+                          DoubleTapped="OnBoneTreeDoubleTapped"
+                          ScrollViewer.VerticalScrollBarVisibility="Auto"
+                          ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                  <TreeView.Styles>
+                    <Style Selector="TreeViewItem">
+                      <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}"/>
+                      <Setter Property="FontSize" Value="12"/>
+                    </Style>
+                  </TreeView.Styles>
+                  <TreeView.DataTemplates>
+                    <TreeDataTemplate DataType="local:BoneTreeNode" ItemsSource="{Binding Children}">
+                      <Border Background="Transparent" HorizontalAlignment="Stretch"
+                              Padding="3,1" ToolTip.Tip="{Binding ToolTip}">
+                        <Grid ColumnDefinitions="Auto,*,Auto">
+                          <TextBlock Grid.Column="0" Text="◇" Foreground="#72aee6"
+                                     FontSize="11" FontWeight="Bold" Margin="0,0,5,0"/>
+                          <TextBlock Grid.Column="1" Text="{Binding Name}"
+                                     TextTrimming="CharacterEllipsis"/>
+                          <TextBlock Grid.Column="2" Text="{Binding Badge}" Foreground="#e5b567"
+                                     FontSize="10" Margin="6,0,2,0"/>
+                        </Grid>
+                      </Border>
+                    </TreeDataTemplate>
+                  </TreeView.DataTemplates>
+                </TreeView>
+              </Border>
+              <TextBlock x:Name="BoneRootStatusText" Text="加载模型后显示骨骼层级"
+                         Foreground="#e5b567" FontSize="11" TextWrapping="Wrap" Margin="1,0,1,7"/>
+              <Border Background="#20252d" BorderBrush="#303947" BorderThickness="1"
+                      CornerRadius="4" Padding="8" Margin="0,0,0,7" MinHeight="92">
+                <TextBlock x:Name="BoneSelectionInfoText" Text="未加载模型"
+                           Foreground="#c8d0da" FontSize="11" TextWrapping="Wrap"/>
+              </Border>
+              <Grid ColumnDefinitions="*,*,*" ColumnSpacing="6">
+                <Button Grid.Column="0" Content="全部展开" Click="OnBoneExpandAll"
+                        FontSize="12" HorizontalContentAlignment="Center" Padding="5,5"/>
+                <Button Grid.Column="1" Content="全部折叠" Click="OnBoneCollapseAll"
+                        FontSize="12" HorizontalContentAlignment="Center" Padding="5,5"/>
+                <Button Grid.Column="2" Content="取景选中" Click="OnBoneFrameSelected"
+                        Background="#205b86" Foreground="White"
+                        FontSize="12" HorizontalContentAlignment="Center" Padding="5,5"
+                        ToolTip.Tip="双击骨骼也可以取景"/>
+              </Grid>
+            </StackPanel>
+          </TabItem>
+        </TabControl>
+
+        <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+          <StackPanel>
+          <!-- Merge panel: collect multiple models then load-merge with smart skeleton check -->
+          <TextBlock Text="场景合并" Foreground="#aab2c0" FontWeight="SemiBold" Margin="0,0,0,7"/>
+          <Border Background="#20252d" BorderBrush="#303947" BorderThickness="1" CornerRadius="6" Padding="10" Margin="0,0,0,12">
+            <StackPanel>
+              <TextBlock Text="收集角色分件并加载到同一预览场景；同名骨骼会同步播放动画。"
+                         Foreground="#666" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,6"/>
+              <ListBox x:Name="MergeListBox" Height="130" Margin="0,0,0,6"/>
+              <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,0,0,6">
+                <Button x:Name="MergeAddButton" Content="添加选中" Click="OnMergeAddClicked"/>
+                <Button x:Name="MergeRemoveButton" Content="移除" Click="OnMergeRemoveClicked"/>
+                <Button x:Name="MergeClearButton" Content="清空" Click="OnMergeClearClicked"/>
+              </StackPanel>
+              <Border Background="#1b222b" BorderBrush="#354354" BorderThickness="1"
+                      CornerRadius="5" Padding="8" Margin="0,0,0,6">
+                <StackPanel>
+                  <TextBlock Text="模型组装预设"
+                             Foreground="#9cdcfe" FontWeight="SemiBold" Margin="0,0,0,5"/>
+                  <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="6">
+                    <TextBox Grid.Column="0" x:Name="AssemblyPresetNameBox"
+                             Watermark="输入预设名称后保存"/>
+                    <Button Grid.Column="1" Content="保存预设"
+                            Click="OnAssemblyPresetSaveClicked"/>
+                    <Button Grid.Column="2" Content="加载预设"
+                            Click="OnAssemblyPresetLoadClicked"/>
+                  </Grid>
+                  <Button Content="打开预设目录" Click="OnAssemblyPresetFolderClicked"
+                          Margin="0,6,0,0" HorizontalAlignment="Stretch"/>
+                  <TextBlock x:Name="AssemblyPresetHint"
+                             Text="当前分类：未识别"
+                             Foreground="#737b87" FontSize="10"
+                             TextWrapping="Wrap" Margin="0,6,0,0"/>
+                </StackPanel>
+              </Border>
+              <Button x:Name="MergeLoadButton" Content="合并加载" Click="OnMergeLoadClicked"
+                      Background="#0e639c" Foreground="#fff" Margin="0,4,0,0"/>
+            </StackPanel>
+          </Border>
+
+          <TextBlock Text="当前选择" Foreground="#aab2c0" FontWeight="SemiBold" Margin="0,0,0,7"/>
+          <Border Background="#20252d" BorderBrush="#303947" BorderThickness="1" CornerRadius="6" Padding="10" Margin="0,0,0,12">
+            <SelectableTextBlock x:Name="OpenFileText" Text="（未选择）" TextWrapping="Wrap" Foreground="#d4d4d4"/>
+          </Border>
+
+          <TextBlock Text="FBX 导出" Foreground="#aab2c0" FontWeight="SemiBold" Margin="0,0,0,7"/>
+          <TextBlock Text="模型与动画请选择相同的轴向。右侧箭头可切换导出目标。" TextWrapping="Wrap" Foreground="#9aa6b5" FontSize="11" Margin="0,0,0,7"/>
+          <StackPanel Margin="0,0,0,12">
+            <Border Background="#202936" BorderBrush="#3c74ad" BorderThickness="1" CornerRadius="6"
+                    Padding="10" Margin="0,0,0,8">
+              <StackPanel>
+                <TextBlock Text="模型导出" Foreground="#7fc3ff" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                <TextBlock Text="导出当前预览中可见的全部模型分件。"
+                           TextWrapping="Wrap" Foreground="#9aa6b5" FontSize="11" Margin="0,0,0,8"/>
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                  <SplitButton Grid.Column="0" x:Name="ExportButton" Content="导出预览模型 FBX" Click="OnExportClicked"
+                          Background="#2563a8" Foreground="White" Padding="10,7">
+                    <SplitButton.Flyout>
+                      <MenuFlyout Placement="Bottom">
+                        <MenuItem Header="UE（Z 轴向上）" Tag="ue" Click="OnFbxTargetSelected"/>
+                        <MenuItem Header="Unity（Y 轴向上）" Tag="unity" Click="OnFbxTargetSelected"/>
+                      </MenuFlyout>
+                    </SplitButton.Flyout>
+                  </SplitButton>
+                  <Button Classes="export-folder" Grid.Column="1" Content="打开导出文件夹" Click="OnOpenOutputFolderClicked" Padding="10,7"/>
+                </Grid>
+              </StackPanel>
+            </Border>
+
+            <Border Background="#292631" BorderBrush="#765c91" BorderThickness="1" CornerRadius="6" Padding="10">
+              <StackPanel>
+                <TextBlock Text="动画导出" Foreground="#d3a9ff" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                <TextBlock Text="每个动画单独导出，仅含骨架与动画，不附带模型网格。"
+                           TextWrapping="Wrap" Foreground="#9aa6b5" FontSize="11" Margin="0,0,0,8"/>
+                <Grid ColumnDefinitions="Auto,*" RowDefinitions="Auto" Margin="0,0,0,7">
+                  <TextBlock Grid.Row="0" Grid.Column="0" Text="范围" VerticalAlignment="Center" Margin="0,0,8,6"/>
+                  <ComboBox Grid.Row="0" Grid.Column="1" x:Name="ExportAnimScopeCombo" SelectedIndex="0"
+                            SelectionChanged="OnExportAnimScopeChanged"
+                            MinWidth="110" HorizontalAlignment="Stretch" Margin="0,0,0,6">
+                    <ComboBoxItem>当前动画（含预览叠加）</ComboBoxItem>
+                    <ComboBoxItem>当前列表全部动画</ComboBoxItem>
+                    <ComboBoxItem>批量列表全部动画</ComboBoxItem>
+                  </ComboBox>
+                </Grid>
+                <Border x:Name="AnimBatchPanel" IsVisible="False" Margin="0,0,0,10"
+                        Background="#211e29" BorderBrush="#50415f" BorderThickness="1"
+                        CornerRadius="5" Padding="8">
+                  <StackPanel>
+                    <Grid ColumnDefinitions="*,Auto" Margin="0,0,0,2">
+                      <TextBlock Grid.Column="0" Text="MotionList 导出队列"
+                                 Foreground="#d3a9ff" FontWeight="SemiBold"/>
+                      <TextBlock Grid.Column="1" x:Name="AnimBatchCountText" Text="0 个列表"
+                                 Foreground="#9aa6b5" FontSize="11" VerticalAlignment="Center"/>
+                    </Grid>
+                    <TextBlock Text="每个列表中的所有动画都会单独导出。"
+                               Foreground="#8f97a3" FontSize="11" Margin="0,0,0,7"/>
+
+                    <Grid ColumnDefinitions="*,*" ColumnSpacing="6" Margin="0,0,0,7">
+                      <Button Grid.Column="0" Content="＋ 添加左侧选中"
+                              Click="OnAnimBatchAddSelectedClicked" HorizontalAlignment="Stretch"
+                              HorizontalContentAlignment="Center" Padding="7,6"
+                              ToolTip.Tip="添加左侧当前选中的 MotionList，支持 Ctrl / Shift 多选"/>
+                      <Button Grid.Column="1" Content="＋ 添加全部搜索结果"
+                              Click="OnAnimBatchAddSearchResultsClicked" HorizontalAlignment="Stretch"
+                              HorizontalContentAlignment="Center" Padding="7,6"
+                              ToolTip.Tip="将左侧当前搜索出来的所有 MotionList 一次加入"/>
+                    </Grid>
+
+                    <ListBox x:Name="AnimBatchListBox" Height="110" Margin="0,0,0,7"
+                             SelectionMode="Multiple" Background="#17151d"
+                             BorderBrush="#3b3444" BorderThickness="1"
+                             ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                      <ListBox.ItemTemplate>
+                        <DataTemplate>
+                          <TextBlock Text="{Binding}" ToolTip.Tip="{Binding}"
+                                     TextTrimming="CharacterEllipsis" Margin="3,1"/>
+                        </DataTemplate>
+                      </ListBox.ItemTemplate>
+                    </ListBox>
+
+                    <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="6">
+                      <TextBlock Grid.Column="0" Text="Ctrl / Shift 可多选"
+                                 Foreground="#737b87" FontSize="10" VerticalAlignment="Center"/>
+                      <Button Grid.Column="1" Content="移除选中" Click="OnAnimBatchRemoveClicked"
+                              Padding="8,4"/>
+                      <Button Grid.Column="2" Content="清空队列" Click="OnAnimBatchClearClicked"
+                              Padding="8,4"/>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                  <SplitButton Grid.Column="0" x:Name="ExportAnimButton" Content="导出动画 FBX" Click="OnExportAnimClicked"
+                          Background="#65417f" Foreground="White" Padding="10,7">
+                    <SplitButton.Flyout>
+                      <MenuFlyout Placement="Bottom">
+                        <MenuItem Header="UE（Z 轴向上）" Tag="ue" Click="OnFbxTargetSelected"/>
+                        <MenuItem Header="Unity（Y 轴向上）" Tag="unity" Click="OnFbxTargetSelected"/>
+                      </MenuFlyout>
+                    </SplitButton.Flyout>
+                  </SplitButton>
+                  <Button Classes="export-folder" Grid.Column="1" Content="打开导出文件夹" Click="OnOpenOutputFolderClicked" Padding="10,7"/>
+                </Grid>
+              </StackPanel>
+            </Border>
+          </StackPanel>
+          <TextBlock Text="资源详情" Foreground="#aab2c0" FontWeight="SemiBold" Margin="0,0,0,7"/>
+          <Border Background="#20252d" BorderBrush="#303947" BorderThickness="1" CornerRadius="6" Padding="10" Margin="0,0,0,12">
+            <SelectableTextBlock x:Name="InfoText" Text="选择左侧文件查看详情" TextWrapping="Wrap" Foreground="#d4d4d4"/>
+          </Border>
+          </StackPanel>
+        </ScrollViewer>
+      </DockPanel>
+      <GridSplitter x:Name="LogSplitter" Grid.Row="1" Grid.Column="2" Height="5" Margin="6,0,6,0"
+                    Background="#3f3f46" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                    ResizeDirection="Rows" ResizeBehavior="PreviousAndNext" Cursor="SizeNorthSouth"/>
+
+      <Border Grid.Row="2" Grid.Column="2" x:Name="LogPanel" IsVisible="True" MinHeight="90"
+              Background="#111419" BorderBrush="#303947" BorderThickness="1" Margin="6,0,6,0">
+        <Grid RowDefinitions="Auto,*">
+          <Border Grid.Row="0" Background="#20252d" Height="28">
+            <TextBlock Text="输出日志" FontWeight="SemiBold"
+                       VerticalAlignment="Center" Margin="8,0,0,0"/>
+          </Border>
+          <TextBox Grid.Row="1" x:Name="RunLogBox" IsReadOnly="True" AcceptsReturn="True" TextWrapping="NoWrap"
+                   FontFamily="Consolas" FontSize="11" Margin="6"
+                   ScrollViewer.VerticalScrollBarVisibility="Auto"
+                   ScrollViewer.HorizontalScrollBarVisibility="Auto"/>
+        </Grid>
+      </Border>
+
+    </Grid>
+  </DockPanel>
+  <Button x:Name="FeedbackLauncher" Grid.Column="0" Content="✎  反馈" Click="OnFeedbackToggleClicked"
+          HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,18,48"
+          Background="#2379d9" Foreground="White" CornerRadius="22" Padding="17,12"/>
+  <local:FeedbackPanel x:Name="FeedbackSidebar" Grid.Column="1" Width="380" IsVisible="False"/>
+  </Grid>
+</Window>
+

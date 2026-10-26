@@ -1,0 +1,65 @@
+using System;
+using System.IO;
+using System.Text.Json;
+
+namespace ReExtractor.Gui;
+
+public sealed class AppSettings
+{
+    public bool UnityFbxAxes { get; set; }
+    public string BlenderPath { get; set; } = "";
+    public string OutputDirectory { get; set; } = AppPaths.OutputDirectory;
+    public string LastGameDirectory { get; set; } = "";
+    public string LastListPath { get; set; } = "";
+}
+
+public static class AppSettingsService
+{
+    private static readonly string SettingsDirectory = AppPaths.DataDirectory;
+    private static readonly string SettingsPath = Path.Combine(SettingsDirectory, "settings.json");
+
+    public static AppSettings Load()
+    {
+        try
+        {
+            if (File.Exists(SettingsPath))
+            {
+                var settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsPath)) ?? CreateDefault();
+                var normalizedBlender = BlenderLocator.NormalizeExecutable(settings.BlenderPath);
+                if (normalizedBlender != settings.BlenderPath)
+                {
+                    settings.BlenderPath = normalizedBlender;
+                    Save(settings);
+                }
+                if (string.Equals(settings.OutputDirectory, AppPaths.LegacyOutputDirectory, StringComparison.OrdinalIgnoreCase))
+                    settings.OutputDirectory = AppPaths.OutputDirectory;
+                // 自动定位 Blender：首次运行或路径失效时探测并回填
+                if (string.IsNullOrWhiteSpace(settings.BlenderPath) || !File.Exists(settings.BlenderPath))
+                {
+                    var detected = BlenderLocator.Detect();
+                    if (!string.IsNullOrEmpty(detected))
+                    {
+                        settings.BlenderPath = detected;
+                        Save(settings);
+                    }
+                }
+                return settings;
+            }
+        }
+        catch { }
+        return CreateDefault();
+    }
+
+    public static void Save(AppSettings settings)
+    {
+        Directory.CreateDirectory(SettingsDirectory);
+        File.WriteAllText(SettingsPath, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    private static AppSettings CreateDefault()
+    {
+        var settings = new AppSettings();
+        settings.BlenderPath = BlenderLocator.Detect() ?? "";
+        return settings;
+    }
+}

@@ -1,0 +1,354 @@
+using System.Numerics;
+using ReeLib;
+using ReeLib.Common;
+using ReeLib.Mesh;
+using ReeLib.Mot;
+using SharpGLTF.Scenes;
+
+namespace ReExtractor.Core;
+
+/// <summary>
+/// Converts RE Engine .motlist animations to glTF animation tracks on top of a mesh skeleton.
+/// </summary>
+public sealed class AnimationService
+{
+    private readonly bool _unityAxes;
+    public AnimationService(bool unityAxes = false) => _unityAxes = unityAxes;
+
+    public IReadOnlyList<string> ConvertOneToGlbWithAnimation(
+        ViewportMesh skeletonMesh,
+        Stream motlistStream, string motlistPath,
+        int motionIndex,
+        string outputDirectory,
+        Action<int, int>? progress = null,
+        Func<string, Stream?>? fileResolver = null)
+    {
+        using var resolved = ResolvedMotionList.Read(motlistStream, motlistPath, fileResolver);
+        var motlist = resolved.List;
+        if (motionIndex < 0 || motionIndex >= motlist.Motions.Count)
+            throw new ArgumentOutOfRangeException(nameof(motionIndex), $"Motion index {motionIndex} out of range ({motlist.Motions.Count} motions)");
+        var motion = motlist.Motions[motionIndex];
+        if (motion.MotFile is not MotFile mot)
+            throw new NotSupportedException($"动作编号 {motion.motNumber} 没有可读取的 MOT 数据：{motlistPath}");
+
+        Directory.CreateDirectory(outputDirectory);
+        var stem = Path.GetFileName(motlistPath);
+        var marker = stem.IndexOf(".motlist", StringComparison.OrdinalIgnoreCase);
+        if (marker > 0) stem = stem[..marker];
+
+        var outputPath = Path.Combine(outputDirectory,
+            $"001_{SafeName(stem)}_motion{motionIndex:D3}_id{motion.motNumber}.glb");
+        var boneNames = skeletonMesh.Bones.Select(bone => bone.Name).ToArray();
+        var clip = BuildClip(mot, motion.motNumber, boneNames, skeletonMesh,
+            (int)mot.Header.version == 892, motlistPath);
+        var visibleGroups = skeletonMesh.Groups.Select(group => group.Key).ToHashSet();
+        new ViewportExportService(_unityAxes).ConvertToAnimatedGlb(skeletonMesh, visibleGroups, clip, outputPath);
+        progress?.Invoke(1, 1);
+        return new[] { outputPath };
+    }
+public IReadOnlyList<string> ConvertAllToGlbWithAnimation(
+        ViewportMesh skeletonMesh,
+        Stream motlistStream, string motlistPath,
+        string outputDirectory,
+        Action<int, int>? progress = null,
+        Func<string, Stream?>? fileResolver = null)
+    {
+        using var resolved = ResolvedMotionList.Read(motlistStream, motlistPath, fileResolver);
+        var motlist = resolved.List;
+        Directory.CreateDirectory(outputDirectory);
+        var stem = Path.GetFileName(motlistPath);
+        var marker = stem.IndexOf(".motlist", StringComparison.OrdinalIgnoreCase);
+        if (marker > 0) stem = stem[..marker];
+
+        var outputs = new List<string>();
+        var exportableCount = motlist.Motions.Count(motion => motion.MotFile is MotFile);
+        var boneNames = skeletonMesh.Bones.Select(bone => bone.Name).ToArray();
+        var exporter = new ViewportExportService(_unityAxes);
+        var visibleGroups = skeletonMesh.Groups.Select(group => group.Key).ToHashSet();
+        for (var index = 0; index < motlist.Motions.Count; index++)
+        {
+            var motion = motlist.Motions[index];
+            if (motion.MotFile is not MotFile mot) continue;
+            var outputPath = Path.Combine(outputDirectory,
+                $"{outputs.Count + 1:D3}_{SafeName(stem)}_motion{index:D3}_id{motion.motNumber}.glb");
+            var clip = BuildClip(mot, motion.motNumber, boneNames, skeletonMesh,
+                (int)mot.Header.version == 892, motlistPath);
+            exporter.ConvertToAnimatedGlb(skeletonMesh, visibleGroups, clip, outputPath);
+            outputs.Add(outputPath);
+            progress?.Invoke(outputs.Count, exportableCount);
+        }
+        return outputs;
+    }
+
+    public IReadOnlyList<string> ConvertAllToGlbWithAnimation(
+        Stream meshStream, string meshPath,
+        Stream motlistStream, string motlistPath,
+        string outputDirectory,
+        Action<int, int>? progress = null,
+        Func<string, Stream?>? fileResolver = null)
+    {
+        if (KunitsuLegacyLegAxes.IsDamageList(motlistPath) && meshPath.EndsWith(".mesh.240306278", StringComparison.OrdinalIgnoreCase))
+        {
+            var viewport = ViewportDataLoader.LoadMesh(meshStream, meshPath, openResource: fileResolver, loadTextures: false);
+            return ConvertAllToGlbWithAnimation(viewport, motlistStream, motlistPath, outputDirectory, progress, fileResolver);
+        }
+        using var mesh = MeshService.LoadMesh(meshStream, meshPath);
+        using var resolved = ResolvedMotionList.Read(motlistStream, motlistPath, fileResolver);
+        var motlist = resolved.List;
+        Directory.CreateDirectory(outputDirectory);
+        var stem = Path.GetFileName(motlistPath);
+        var marker = stem.IndexOf(".motlist", StringComparison.OrdinalIgnoreCase);
+        if (marker > 0) stem = stem[..marker];
+
+        var outputs = new List<string>();
+        var exportableCount = motlist.Motions.Count(motion => motion.MotFile is MotFile);
+        for (var index = 0; index < motlist.Motions.Count; index++)
+        {
+            var motion = motlist.Motions[index];
+            if (motion.MotFile is not MotFile mot) continue;
+            var outputPath = Path.Combine(outputDirectory,
+                $"{outputs.Count + 1:D3}_{SafeName(stem)}_动作{index:D3}_编号{motion.motNumber}.glb");
+            WriteMotionGlb(mesh, mot, motion.motNumber, outputPath, motlistPath);
+            outputs.Add(outputPath);
+            progress?.Invoke(outputs.Count, exportableCount);
+        }
+        return outputs;
+    }
+
+    /// <summary>
+    /// Export mesh + skeleton + one motion from a .motlist as GLB with animation.
+    /// </summary>
+    public string ConvertToGlbWithAnimation(
+        Stream meshStream, string meshPath,
+        Stream motlistStream, string motlistPath,
+        string outputPath, int motionIndex = 0,
+        Func<string, Stream?>? fileResolver = null)
+    {
+        if (KunitsuLegacyLegAxes.IsDamageList(motlistPath) && meshPath.EndsWith(".mesh.240306278", StringComparison.OrdinalIgnoreCase))
+        {
+            var viewport = ViewportDataLoader.LoadMesh(meshStream, meshPath, openResource: fileResolver, loadTextures: false);
+            using var source = ResolvedMotionList.Read(motlistStream, motlistPath, fileResolver);
+            var selected = source.List.Motions.ElementAtOrDefault(motionIndex)
+                ?? throw new ArgumentOutOfRangeException(nameof(motionIndex));
+            if (selected.MotFile is not MotFile legacyMotion) throw new NotSupportedException("动作没有可读取的 MOT 数据");
+            var clip = BuildClip(legacyMotion, selected.motNumber, viewport.Bones.Select(b=>b.Name).ToArray(), viewport, false, motlistPath);
+            new ViewportExportService(_unityAxes).ConvertToAnimatedGlb(viewport, viewport.Groups.Select(g=>g.Key).ToHashSet(), clip, outputPath);
+            return outputPath;
+        }
+        using var mesh = MeshService.LoadMesh(meshStream, meshPath);
+        using var resolved = ResolvedMotionList.Read(motlistStream, motlistPath, fileResolver);
+        var motlist = resolved.List;
+
+        var motion = motlist.Motions.ElementAtOrDefault(motionIndex)
+            ?? throw new InvalidDataException($"Motion index {motionIndex} out of range ({motlist.Motions.Count} motions)");
+        if (motion.MotFile is not MotFile mot)
+            throw new NotSupportedException($"动作编号 {motion.motNumber} 没有可读取的 MOT 数据：{motlistPath}");
+
+        return WriteMotionGlb(mesh, mot, motion.motNumber, outputPath, motlistPath);
+    }
+
+    private static string WriteMotionGlb(MeshFile mesh, MotFile mot, int motionNumber, string outputPath, string motlistPath)
+    {
+        MotionSkeletonCompatibility.Validate(mot, mesh.BoneData);
+        var scene = new SceneBuilder();
+        var skeleton = MeshService.BuildSkeletonInternal(mesh.BoneData);
+        MeshService.ExportGeometry(scene, mesh, skeleton, lodIndex: 0);
+
+        var animName = $"mot_{motionNumber}";
+        var applied = 0;
+        foreach (var clip in mot.BoneClips)
+        {
+            var node = ResolveBoneNode(skeleton, mesh, clip);
+            if (node == null) continue;
+            var binding = node.LocalMatrix;
+            var poseTrack = new BoneTrack { IsAdditive = ViewportDataLoader.UsesAdditiveFaceTrack(mot, node.Name, motlistPath) };
+
+            if (clip.HasRotation && clip.Rotation!.rotations is { Length: > 0 } rotations)
+            {
+                var frames = clip.Rotation.frameIndexes;
+                var fps = clip.Rotation.frameRate > 0 ? clip.Rotation.frameRate : 60u;
+                var keys = new Dictionary<float, Quaternion>(rotations.Length);
+                for (var i = 0; i < rotations.Length; i++)
+                {
+                    var t = frames != null && i < frames.Length ? frames[i] / (float)fps : i / (float)fps;
+                    var q = rotations[i];
+                    if (q.W < 0) q = new Quaternion(-q.X, -q.Y, -q.Z, -q.W);
+                    keys[t] = poseTrack.ResolveRotation(Quaternion.Normalize(q), binding);
+                }
+                node.WithLocalRotation(animName, keys);
+            }
+
+            if (clip.HasTranslation && clip.Translation!.translations is { Length: > 0 } translations)
+            {
+                var frames = clip.Translation.frameIndexes;
+                var fps = clip.Translation.frameRate > 0 ? clip.Translation.frameRate : 60u;
+                var keys = new Dictionary<float, Vector3>(translations.Length);
+                for (var i = 0; i < translations.Length; i++)
+                {
+                    var t = frames != null && i < frames.Length ? frames[i] / (float)fps : i / (float)fps;
+                    keys[t] = poseTrack.ResolveTranslation(translations[i], binding);
+                }
+                node.WithLocalTranslation(animName, keys);
+            }
+
+            if (mot.Header.version == MotVersion.RE_RT &&
+                clip.HasScale && clip.Scale!.translations is { Length: > 0 } scales)
+            {
+                var fps = TrackFrameRate(clip.Scale);
+                var times = BuildTimes(clip.Scale.frameIndexes, scales.Length, fps);
+                var keys = new Dictionary<float, Vector3>(scales.Length);
+                for (var i = 0; i < scales.Length; i++) keys[times[i]] = scales[i];
+                node.WithLocalScale(animName, keys);
+            }
+            applied++;
+        }
+
+        Console.WriteLine($"[anim] motion #{motionNumber}: {applied}/{mot.BoneClips.Count} bone clips applied");
+
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+        scene.ToGltf2().SaveGLB(outputPath);
+        return outputPath;
+    }
+
+    private static string SafeName(string value)
+    {
+        foreach (var c in Path.GetInvalidFileNameChars()) value = value.Replace(c, '_');
+        return value.Length > 80 ? value[..80] : value;
+    }
+
+    private static AnimationClip BuildClip(
+        MotFile mot,
+        int motionNumber,
+        IReadOnlyList<string> meshBoneNames,
+        ViewportMesh skeletonMesh,
+        bool usesReferencePoseTracks, string motlistPath)
+    {
+        MotionSkeletonCompatibility.Validate(mot, skeletonMesh);
+        var hashToBone = new Dictionary<uint, (int Index, string Name)>(meshBoneNames.Count);
+        for (var i = 0; i < meshBoneNames.Count; i++)
+        {
+            var name = skeletonMesh.AnimationBoneAliases.TryGetValue(meshBoneNames[i], out var alias)
+                ? alias : meshBoneNames[i];
+            if (name.Length > 0) hashToBone.TryAdd(MurMur3HashUtils.GetHash(name), (i, name));
+        }
+
+        var tracks = new Dictionary<int, BoneTrack>();
+        var namedTracks = new Dictionary<string, BoneTrack>(StringComparer.OrdinalIgnoreCase);
+        var duration = 0f;
+        var sourceFrameRate = 60;
+        var sourceFrameCount = 0;
+        foreach (var clip in mot.BoneClips)
+        {
+            (int Index, string Name) target;
+            if (!hashToBone.TryGetValue(clip.ClipHeader.boneHash, out target))
+            {
+                var fallbackIndex = clip.ClipHeader.boneIndex;
+                if (clip.ClipHeader.boneHash != 0 ||
+                    fallbackIndex < 0 ||
+                    fallbackIndex >= meshBoneNames.Count)
+                    continue;
+                target = (fallbackIndex, meshBoneNames[fallbackIndex]);
+            }
+
+            var track = new BoneTrack { IsAdditive = ViewportDataLoader.UsesAdditiveFaceTrack(mot, target.Name, motlistPath) };
+            if (clip.HasTranslation && clip.Translation!.translations is { Length: > 0 } translations)
+            {
+                var fps = TrackFrameRate(clip.Translation);
+                var frames = clip.Translation.frameIndexes;
+                var maxFrame = TrackMaxFrame(clip.Translation, translations.Length);
+                track.TransTimes = BuildTimes(frames, translations.Length, fps);
+                track.Translations = translations;
+                sourceFrameRate = Math.Max(sourceFrameRate, (int)fps);
+                sourceFrameCount = Math.Max(sourceFrameCount, (int)MathF.Round(maxFrame));
+                duration = Math.Max(duration, maxFrame / fps);
+            }
+
+            if (clip.HasRotation && clip.Rotation!.rotations is { Length: > 0 } rotations)
+            {
+                var fps = TrackFrameRate(clip.Rotation);
+                var frames = clip.Rotation.frameIndexes;
+                var maxFrame = TrackMaxFrame(clip.Rotation, rotations.Length);
+                track.RotTimes = BuildTimes(frames, rotations.Length, fps);
+                track.Rotations = rotations.Select(q => q.W < 0
+                        ? new Quaternion(-q.X, -q.Y, -q.Z, -q.W)
+                        : q)
+                    .Select(Quaternion.Normalize)
+                    .ToArray();
+                sourceFrameRate = Math.Max(sourceFrameRate, (int)fps);
+                sourceFrameCount = Math.Max(sourceFrameCount, (int)MathF.Round(maxFrame));
+                duration = Math.Max(duration, maxFrame / fps);
+            }
+
+            if (mot.Header.version == MotVersion.RE_RT &&
+                clip.HasScale && clip.Scale!.translations is { Length: > 0 } scales)
+            {
+                var fps = TrackFrameRate(clip.Scale);
+                var maxFrame = TrackMaxFrame(clip.Scale, scales.Length);
+                track.ScaleTimes = BuildTimes(clip.Scale.frameIndexes, scales.Length, fps);
+                track.Scales = scales;
+                sourceFrameRate = Math.Max(sourceFrameRate, (int)fps);
+                sourceFrameCount = Math.Max(sourceFrameCount, (int)MathF.Round(maxFrame));
+                duration = Math.Max(duration, maxFrame / fps);
+            }
+            tracks[target.Index] = track;
+            namedTracks[target.Name] = track;
+        }
+
+        if (usesReferencePoseTracks)
+        {
+            ViewportDataLoader.RetargetMot892Tracks(mot, namedTracks, skeletonMesh);
+            foreach (var (name, track) in namedTracks)
+                if (hashToBone.TryGetValue(MurMur3HashUtils.GetHash(name), out var target))
+                    tracks[target.Index] = track;
+        }
+
+        var result = new AnimationClip
+        {
+            Name = $"mot_{motionNumber}",
+            Duration = duration,
+            FrameRate = sourceFrameRate, FrameCount = sourceFrameCount,
+            Tracks = tracks,
+            NamedTracks = namedTracks,
+        };
+        result = KunitsuLegacyLegAxes.Retarget(mot, motionNumber, motlistPath, result, meshBoneNames);
+        return skeletonMesh.JointConstraints?.Bake(skeletonMesh, result) ?? result;
+    }
+
+    private static uint TrackFrameRate(Track track) => track.frameRate > 0 ? track.frameRate : 60u;
+
+    private static float TrackMaxFrame(Track track, int count)
+    {
+        if (track.frameIndexes is { Length: > 0 } frames) return frames[^1];
+        return Math.Max(0, count - 1);
+    }
+
+    private static float[] BuildTimes(int[]? frames, int count, uint fps)
+    {
+        var times = new float[count];
+        for (var i = 0; i < count; i++)
+            times[i] = frames != null && i < frames.Length ? frames[i] / (float)fps : i / (float)fps;
+        return times;
+    }
+
+    private static SharpGLTF.Scenes.NodeBuilder? ResolveBoneNode(
+        MeshService.SkeletonData skeleton, MeshFile mesh, BoneMotionClip clip)
+    {
+        var hierarchy = skeleton.Hierarchy;
+        if (hierarchy == null || skeleton.AllNodes.Length == 0) return null;
+
+        // 1) hash lookup (requires bone names on the mesh side)
+        var header = clip.ClipHeader;
+        MeshBone? bone = null;
+        if (header.boneHash != 0)
+            bone = hierarchy.GetByHash(header.boneHash);
+
+        // A nonzero hash identifies a specific bone. MOT-only facial helpers
+        // are absent from some mesh parts; falling back by index then animates
+        // an unrelated shoulder/face bone. Match the preview/export-clip path.
+        if (header.boneHash != 0 && bone == null) return null;
+        if (header.boneHash == 0) bone = hierarchy.GetByIndex(header.boneIndex);
+
+        if (bone == null || bone.index < 0 || bone.index >= skeleton.AllNodes.Length) return null;
+        return skeleton.AllNodes[bone.index];
+    }
+}

@@ -1,0 +1,336 @@
+using System.Numerics;
+using SharpGLTF.Geometry;
+using SharpGLTF.Geometry.VertexTypes;
+using SharpGLTF.Materials;
+using SharpGLTF.Memory;
+using SharpGLTF.Scenes;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Formats.Png;
+using SixLabors.ImageSharp.PixelFormats;
+
+namespace ReExtractor.Core;
+
+/// <summary>Exports exactly what the interactive viewport currently shows.</summary>
+public sealed class ViewportExportService
+{
+    private readonly bool _unityAxes;
+    public ViewportExportService(bool unityAxes = false) => _unityAxes = unityAxes;
+    private static readonly Matrix4x4 ReToUeWorld = new(
+        1, 0, 0, 0,
+        0, 0, 1, 0,
+        0, -1, 0, 0,
+        0, 0, 0, 1);
+    public string ConvertToGlb(ViewportMesh mesh, IReadOnlySet<int> visibleGroups, string outputPath)
+    {
+        var (scene, _) = BuildScene(mesh, visibleGroups, Path.GetFileNameWithoutExtension(outputPath));
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+        scene.ToGltf2().SaveGLB(outputPath);
+        return outputPath;
+    }
+
+    public string ConvertToAnimatedGlb(ViewportMesh mesh, IReadOnlySet<int> visibleGroups, AnimationClip clip, string outputPath)
+    {
+        var (scene, nodes) = BuildScene(mesh, visibleGroups, Path.GetFileNameWithoutExtension(outputPath));
+        ApplyAnimation(nodes, clip, mesh.AnimationBoneAliases);
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+        scene.ToGltf2().SaveGLB(outputPath);
+        return outputPath;
+    }
+
+    private (SceneBuilder Scene, NodeBuilder[] Nodes) BuildScene(ViewportMesh mesh, IReadOnlySet<int> visibleGroups, string meshName)
+    {
+        var scene = new SceneBuilder();
+        var materials = BuildMaterials(mesh);
+        var skeleton = BuildSkeleton(mesh);
+        if (skeleton.Joints.Length > 0)
+        {
+            // One MeshBuilder with multiple material primitives becomes ONE mesh object in
+            // Blender/FBX/UE. A builder per material would produce scattered mesh objects.
+            var builder = new MeshBuilder<VertexPositionNormal, VertexTexture1, VertexJoints8>(meshName);
+            var hasGeometry = false;
+            for (var slot = -1; slot < Math.Max(1, mesh.Textures.Length); slot++)
+            {
+                var material = materials.TryGetValue(slot, out var found) ? found : materials[-1];
+                var primitive = builder.UsePrimitive(material);
+                for (var face = 0; face < mesh.Faces.Length; face++)
+                {
+                    if (!IsVisible(mesh, visibleGroups, face) || IsExportHidden(mesh, face) || TextureSlot(mesh, face) != slot) continue;
+                    var (a, b, c) = mesh.Faces[face];
+                    primitive.AddTriangle(SkinnedVertex(mesh, a), SkinnedVertex(mesh, b), SkinnedVertex(mesh, c));
+                    hasGeometry = true;
+                }
+            }
+            if (hasGeometry) scene.AddSkinnedMesh(builder, skeleton.Joints);
+        }
+        else
+        {
+            var builder = new MeshBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>(meshName);
+            var hasGeometry = false;
+            for (var slot = -1; slot < Math.Max(1, mesh.Textures.Length); slot++)
+            {
+                var material = materials.TryGetValue(slot, out var found) ? found : materials[-1];
+                var primitive = builder.UsePrimitive(material);
+                for (var face = 0; face < mesh.Faces.Length; face++)
+                {
+                    if (!IsVisible(mesh, visibleGroups, face) || IsExportHidden(mesh, face) || TextureSlot(mesh, face) != slot) continue;
+                    var (a, b, c) = mesh.Faces[face];
+                    primitive.AddTriangle(Vertex(mesh, a), Vertex(mesh, b), Vertex(mesh, c));
+                    hasGeometry = true;
+                }
+            }
+            if (hasGeometry) scene.AddRigidMesh(builder, _unityAxes ? Matrix4x4.Identity : ReToUeWorld);
+        }
+        return (scene, skeleton.Nodes);
+    }
+
+    /// <summary>Combines every visible preview part into one geometry and one union skeleton.</summary>
+    public string ConvertMergedToGlb(
+        IReadOnlyList<(ViewportMesh Mesh, IReadOnlySet<int> VisibleGroups)> models,
+        string outputPath)
+    {
+        if (models.Count == 0) throw new ArgumentException("至少需要一个模型", nameof(models));
+        var merged = BuildMergedExportModel(models);
+        return ConvertToGlb(merged.Mesh, merged.VisibleGroups, outputPath);
+    }
+
+    public string ConvertMergedToAnimatedGlb(
+        IReadOnlyList<(ViewportMesh Mesh, IReadOnlySet<int> VisibleGroups)> models,
+        AnimationClip clip,
+        string outputPath)
+    {
+        var merged = BuildMergedExportModel(models);
+        return ConvertToAnimatedGlb(merged.Mesh, merged.VisibleGroups, clip, outputPath);
+    }
+
+    public (ViewportMesh Mesh, IReadOnlySet<int> VisibleGroups) BuildMergedExportModel(
+        IReadOnlyList<(ViewportMesh Mesh, IReadOnlySet<int> VisibleGroups)> models)
+    {
+        if (models.Count == 0) throw new ArgumentException("need at least one model", nameof(models));
+        if (models.Count == 1) return (models[0].Mesh, models[0].VisibleGroups);
+
+        var visibleMeshes = models.Select(model => VisibleCopy(model.Mesh, model.VisibleGroups)).ToArray();
+        var merged = PreviewSkeletonExport.Merge(visibleMeshes);
+        return (merged, merged.Groups.Select(group => group.Key).ToHashSet());
+    }
+
+    private static ViewportMesh VisibleCopy(ViewportMesh mesh, IReadOnlySet<int> visibleGroups)
+    {
+        var faces = new List<(int A, int B, int C)>();
+        var faceTexture = new List<int>();
+        var faceAlpha = new List<bool>();
+        var faceExportHidden = new List<bool>();
+        var faceGroups = new List<int>();
+        for (var face = 0; face < mesh.Faces.Length; face++)
+        {
+            if (!IsVisible(mesh, visibleGroups, face)) continue;
+            faces.Add(mesh.Faces[face]);
+            faceTexture.Add(TextureSlot(mesh, face));
+            faceAlpha.Add(face < mesh.FaceAlphaCutout.Length && mesh.FaceAlphaCutout[face]);
+            faceExportHidden.Add(face < mesh.FaceExportHidden.Length && mesh.FaceExportHidden[face]);
+            faceGroups.Add(face < mesh.FaceGroups.Length ? mesh.FaceGroups[face] : -1);
+        }
+
+        return new ViewportMesh
+        {
+            Vertices = mesh.Vertices,
+            Normals = mesh.Normals,
+            Uvs = mesh.Uvs,
+            Faces = faces.ToArray(),
+            FaceTexture = faceTexture.ToArray(),
+            FaceAlphaCutout = faceAlpha.ToArray(),
+            FaceExportHidden = faceExportHidden.ToArray(),
+            FaceGroups = faceGroups.ToArray(),
+            Groups = mesh.Groups.Where(group => visibleGroups.Contains(group.Key)).Select(group => new ViewportGroup
+            {
+                Key = group.Key,
+                Id = group.Id,
+                Name = group.Name,
+                Materials = group.Materials,
+                FaceCount = group.FaceCount,
+                DefaultVisible = true,
+                IsHelper = group.IsHelper,
+            }).ToArray(),
+            Textures = mesh.Textures,
+            Weights = mesh.Weights,
+            Bones = mesh.Bones,
+            DeformToBone = mesh.DeformToBone,
+            VisconInfo = mesh.VisconInfo,
+        };
+    }
+
+    private static int TextureSlot(ViewportMesh mesh, int face)
+        => face < mesh.FaceTexture.Length ? mesh.FaceTexture[face] : -1;
+
+    private static bool IsExportHidden(ViewportMesh mesh, int face)
+        => face < mesh.FaceExportHidden.Length && mesh.FaceExportHidden[face];
+
+    private sealed record SkeletonBuild(
+        (NodeBuilder Joint, Matrix4x4 InverseBindMatrix)[] Joints,
+        NodeBuilder[] Nodes);
+
+    private SkeletonBuild BuildSkeleton(ViewportMesh mesh)
+    {
+        if (mesh.Bones.Length == 0 || mesh.DeformToBone.Length == 0)
+            return new SkeletonBuild([], []);
+        var nodes = mesh.Bones.Select((bone, index) =>
+        {
+            var local = bone.LocalBind;
+            if (!_unityAxes && bone.ParentIndex < 0) local = local * ReToUeWorld;
+            return new NodeBuilder(bone.Name) { LocalMatrix = local };
+        }).ToArray();
+        for (var i = 0; i < mesh.Bones.Length; i++)
+        {
+            var parent = mesh.Bones[i].ParentIndex;
+            if (parent >= 0 && parent < nodes.Length && parent != i) nodes[parent].AddNode(nodes[i]);
+        }
+        // MOT-only helpers can introduce independent roots. SharpGLTF requires all
+        // skin joints to belong to one tree. An identity parent preserves each
+        // source root's world transform, joint index and inverse bind matrix.
+        var roots = nodes.Select(node => node.Root).Distinct().ToArray();
+        if (roots.Length > 1)
+        {
+            var rootName = "__ReExtractor_SkeletonRoot";
+            while (mesh.Bones.Any(bone => bone.Name == rootName)) rootName += "_";
+            var commonRoot = new NodeBuilder(rootName);
+            foreach (var root in roots) commonRoot.AddNode(root);
+        }
+        // Keep the complete source hierarchy in the glTF skin, including non-deforming
+        // parents such as SF6's Root. Exporting deform joints only makes SharpGLTF omit
+        // those parents; Blender then sees C_Hip as the root and the FBX step cannot
+        // distinguish a genuinely rootless skeleton from a truncated one.
+        var joints = mesh.Bones.Select((bone, boneIndex) =>
+            (nodes[boneIndex], bone.InverseGlobalBind)).ToArray();
+        return new SkeletonBuild(joints, nodes);
+    }
+
+    private static void ApplyAnimation(NodeBuilder[] nodes, AnimationClip clip, IReadOnlyDictionary<string, string> aliases)
+    {
+        var animName = string.IsNullOrWhiteSpace(clip.Name) ? "mot" : clip.Name;
+        for (var i = 0; i < nodes.Length; i++)
+        {
+            var node = nodes[i];
+            var name = aliases.TryGetValue(node.Name, out var alias) ? alias : node.Name;
+            if (name.Length == 0)
+            {
+                node.WithLocalRotation(animName, new Dictionary<float, Quaternion> { [0] = Quaternion.Identity, [Math.Max(clip.Duration, 0.001f)] = Quaternion.Identity });
+                node.WithLocalTranslation(animName, new Dictionary<float, Vector3> { [0] = Vector3.Zero, [Math.Max(clip.Duration, 0.001f)] = Vector3.Zero });
+                node.WithLocalScale(animName, new Dictionary<float, Vector3> { [0] = Vector3.One, [Math.Max(clip.Duration, 0.001f)] = Vector3.One });
+                continue;
+            }
+            if (!clip.NamedTracks.TryGetValue(name, out var track) &&
+                (clip.NamedTracks.Count > 0 || !clip.Tracks.TryGetValue(i, out track)))
+                continue;
+
+            var binding = node.LocalMatrix;
+
+            if (track.ScaleTimes is { Length: > 0 } scaleTimes &&
+                track.Scales is { Length: > 0 } scales)
+            {
+                var keys = new Dictionary<float, Vector3>(Math.Min(scaleTimes.Length, scales.Length));
+                for (var k = 0; k < scaleTimes.Length && k < scales.Length; k++)
+                    keys[scaleTimes[k]] = scales[k];
+                node.WithLocalScale(animName, keys);
+            }
+
+            if (track.RotTimes is { Length: > 0 } rotTimes &&
+                track.Rotations is { Length: > 0 } rotations)
+            {
+                var keys = new Dictionary<float, Quaternion>(Math.Min(rotTimes.Length, rotations.Length));
+                for (var k = 0; k < rotTimes.Length && k < rotations.Length; k++)
+                    keys[rotTimes[k]] = track.ResolveRotation(rotations[k], binding);
+                node.WithLocalRotation(animName, keys);
+            }
+
+            if (track.TransTimes is { Length: > 0 } transTimes &&
+                track.Translations is { Length: > 0 } translations)
+            {
+                var keys = new Dictionary<float, Vector3>(Math.Min(transTimes.Length, translations.Length));
+                for (var k = 0; k < transTimes.Length && k < translations.Length; k++)
+                    // Keep animation keys in the skeleton's native local space. The Blender FBX
+                    // exporter applies the requested Y-forward/Z-up bone-space conversion while
+                    // baking the action. Pre-converting root motion here applies that basis change
+                    // twice and turns forward motion into negative Z (downward) in Unreal Engine.
+                    keys[transTimes[k]] = track.ResolveTranslation(translations[k], binding);
+                node.WithLocalTranslation(animName, keys);
+            }
+        }
+    }
+
+    private static bool IsVisible(ViewportMesh mesh, IReadOnlySet<int> visibleGroups, int face)
+    {
+        if (mesh.Groups.Length == 0 || mesh.FaceGroups.Length != mesh.Faces.Length) return true;
+        return visibleGroups.Contains(mesh.FaceGroups[face]);
+    }
+
+    private VertexBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty> Vertex(ViewportMesh mesh, int index)
+    {
+        var normal = index < mesh.Normals.Length ? mesh.Normals[index] : Vector3.UnitZ;
+        if (normal.LengthSquared() < 1e-6f) normal = Vector3.UnitZ;
+        var uv = index < mesh.Uvs.Length ? mesh.Uvs[index] : Vector2.Zero;
+        return new(new VertexPositionNormal(Vector3.Transform(mesh.Vertices[index], _unityAxes ? Matrix4x4.Identity : ReToUeWorld),
+            Vector3.Normalize(Vector3.TransformNormal(normal, _unityAxes ? Matrix4x4.Identity : ReToUeWorld))), new VertexTexture1(uv));
+    }
+
+    private static VertexBuilder<VertexPositionNormal, VertexTexture1, VertexJoints8> SkinnedVertex(ViewportMesh mesh, int index)
+    {
+        var normal = index < mesh.Normals.Length ? mesh.Normals[index] : Vector3.UnitZ;
+        if (normal.LengthSquared() < 1e-6f) normal = Vector3.UnitZ;
+        var uv = index < mesh.Uvs.Length ? mesh.Uvs[index] : Vector2.Zero;
+        var weights = index < mesh.Weights.Length ? mesh.Weights[index] : [];
+        var top = weights.Where(weight => weight.Item2 > 0 && weight.Item1 >= 0 && weight.Item1 < mesh.DeformToBone.Length)
+            .OrderByDescending(weight => weight.Item2).Take(8).ToArray();
+        if (top.Length == 0) top = [(0, 1f)];
+        var sum = top.Sum(weight => weight.Item2);
+        // The glTF joint table now follows the full bone array. RE vertex weights still
+        // address deform-joint slots, so map each slot back to its full bone index.
+        var bindings = top.Select(weight =>
+            (mesh.DeformToBone[weight.Item1], weight.Item2 / sum)).ToArray();
+        return new(new VertexPositionNormal(mesh.Vertices[index], Vector3.Normalize(normal)),
+            new VertexTexture1(uv), new VertexJoints8(bindings));
+    }
+
+    private static Dictionary<int, MaterialBuilder> BuildMaterials(ViewportMesh mesh)
+    {
+        var result = new Dictionary<int, MaterialBuilder>
+        {
+            [-1] = new MaterialBuilder("无贴图材质").WithMetallicRoughnessShader().WithDoubleSide(true),
+        };
+        for (var slot = 0; slot < mesh.Textures.Length; slot++)
+        {
+            var texture = mesh.Textures[slot];
+            var material = new MaterialBuilder(texture.Name).WithMetallicRoughnessShader().WithDoubleSide(true);
+            material.WithChannelImage(KnownChannel.BaseColor, ImageBuilder.From(ToPng(texture), texture.Name));
+            if (texture.NormalMap is { } normal)
+                material.WithNormal(ImageBuilder.From(ToPng(normal), normal.Name));
+            if (texture.MetallicRoughnessMap is { } surface)
+                material.WithMetallicRoughness(ImageBuilder.From(ToPng(surface), surface.Name), 1f, 1f);
+            var alphaCutout = Enumerable.Range(0, Math.Min(mesh.Faces.Length, mesh.FaceTexture.Length))
+                .Any(face => mesh.FaceTexture[face] == slot &&
+                    face < mesh.FaceAlphaCutout.Length && mesh.FaceAlphaCutout[face]);
+            if (alphaCutout) material.WithAlpha(AlphaMode.MASK, 0.5f);
+            result[slot] = material;
+        }
+        return result;
+    }
+
+    private static MemoryImage ToPng(ViewportTexture texture)
+    {
+        using var image = new Image<Rgba32>(texture.Width, texture.Height);
+        image.ProcessPixelRows(accessor =>
+        {
+            for (var y = 0; y < texture.Height; y++)
+            {
+                var row = accessor.GetRowSpan(y);
+                for (var x = 0; x < texture.Width; x++)
+                {
+                    var pixel = texture.Pixels[y * texture.Width + x];
+                    row[x] = new Rgba32((byte)(pixel >> 16), (byte)(pixel >> 8),
+                        (byte)pixel, (byte)(pixel >> 24));
+                }
+            }
+        });
+        using var stream = new MemoryStream();
+        image.Save(stream, new PngEncoder());
+        return new MemoryImage(stream.ToArray());
+    }
+}

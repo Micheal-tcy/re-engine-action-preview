@@ -1,0 +1,23 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="ReExtractor.Gui.FeedbackPanel" ClipToBounds="True">
+  <Border Background="#1b2028" BorderBrush="#354050" BorderThickness="1,0,0,0">
+    <DockPanel Margin="18,16">
+      <Grid DockPanel.Dock="Top" ColumnDefinitions="*,Auto" Margin="0,0,0,20">
+        <TextBlock Text="问题与建议" FontSize="18" FontWeight="SemiBold" VerticalAlignment="Center"/>
+        <Button Grid.Column="1" Content="✕" Click="OnCloseClicked" ToolTip.Tip="收起反馈区"
+                Background="Transparent"/>
+      </Grid>
+      <StackPanel Spacing="16">
+        <TextBlock Text="前往项目的 GitHub Issues 页面反馈问题或提出建议。请描述使用步骤、预期结果和实际表现，可自行添加截图。"
+                   Foreground="#c0cddd" TextWrapping="Wrap"/>
+        <Button Content="打开 GitHub Issues" Click="OnOpenIssuesClicked" HorizontalAlignment="Stretch"
+                HorizontalContentAlignment="Center" Background="#2379d9" Foreground="White" Padding="14,10"/>
+        <TextBlock x:Name="FeedbackStatus" Text="将在浏览器打开公开的问题页面，由你填写并提交。"
+                   Foreground="#98a6b8" FontSize="12" TextWrapping="Wrap"/>
+        <SelectableTextBlock Text="https://github.com/Micheal-tcy/re-engine-action-preview/issues/new"
+                             Foreground="#8cbcff" FontSize="12" TextWrapping="Wrap"/>
+      </StackPanel>
+    </DockPanel>
+  </Border>
+</UserControl>

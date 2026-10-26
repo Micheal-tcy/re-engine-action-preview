@@ -1,0 +1,312 @@
+import bpy
+import os
+import re
+import sys
+from array import array
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from fbx_export_profiles import prepare_export_axes, axis_options
+
+
+def unpack_pbr_channels_for_fbx():
+    # FBX's material wrapper cannot follow glTF's Separate Color node. Give
+    # roughness/metallic direct image links so both survive FBX re-import.
+    cache = {}
+    for material in bpy.data.materials:
+        if not material.use_nodes:
+            continue
+        tree = material.node_tree
+        for bsdf in [n for n in tree.nodes if n.type == "BSDF_PRINCIPLED"]:
+            for socket_name in ("Roughness", "Metallic"):
+                socket = bsdf.inputs.get(socket_name)
+                if not socket or not socket.is_linked:
+                    continue
+                link = socket.links[0]
+                separate = link.from_node
+                if separate.type not in {"SEPARATE_COLOR", "SEPRGB"}:
+                    continue
+                source_input = separate.inputs[0]
+                if not source_input.is_linked:
+                    continue
+                source = source_input.links[0].from_node
+                if source.type != "TEX_IMAGE" or not source.image:
+                    continue
+                channel = {"Red": 0, "Green": 1, "Blue": 2, "R": 0, "G": 1, "B": 2}.get(link.from_socket.name)
+                if channel is None:
+                    continue
+                key = (source.image.as_pointer(), channel)
+                image = cache.get(key)
+                if image is None:
+                    width, height = source.image.size
+                    data = array('f', [0.0]) * (width * height * 4)
+                    source.image.pixels.foreach_get(data)
+                    values = array('f', [0.0]) * len(data)
+                    for i in range(width * height):
+                        value = data[i * 4 + channel]
+                        values[i * 4:i * 4 + 4] = array('f', [value, value, value, 1.0])
+                    image = bpy.data.images.new(source.image.name + "_" + socket_name, width, height)
+                    image.colorspace_settings.name = "Non-Color"
+                    image.pixels.foreach_set(values)
+                    image.pack()
+                    cache[key] = image
+                node = tree.nodes.new("ShaderNodeTexImage")
+                node.image = image
+                if source.inputs['Vector'].is_linked:
+                    tree.links.new(source.inputs['Vector'].links[0].from_socket, node.inputs['Vector'])
+                tree.links.new(node.outputs['Color'], socket)
+
+
+def arguments():
+    values = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
+    if len(values) != 2:
+        raise RuntimeError("需要参数：临时 GLB 目录、输出 FBX 路径")
+    return values[0], values[1]
+
+
+def clear_scene():
+    bpy.ops.object.select_all(action="SELECT")
+    bpy.ops.object.delete(use_global=False)
+    for block in (bpy.data.meshes, bpy.data.armatures, bpy.data.materials,
+                  bpy.data.images, bpy.data.actions):
+        for item in list(block):
+            block.remove(item)
+
+
+def safe_texture_name(name, used):
+    stem = re.sub(r"[^0-9A-Za-z_.-]+", "_", name).strip("._")
+    stem = stem.replace(".tex", "_tex")
+    if not stem:
+        stem = "texture"
+    if stem.lower().endswith(".png"):
+        stem = stem[:-4]
+    candidate = stem + ".png"
+    index = 1
+    while candidate.lower() in used:
+        candidate = f"{stem}_{index:03d}.png"
+        index += 1
+    used.add(candidate.lower())
+    return candidate
+
+
+def save_external_textures(output_path):
+    output_path = os.path.abspath(output_path)
+    texture_dir = os.path.splitext(output_path)[0] + ".fbm"
+    os.makedirs(texture_dir, exist_ok=True)
+    used = set()
+    saved = 0
+    for image in bpy.data.images:
+        if image.name in {"Render Result", "Viewer Node"}:
+            continue
+        if image.type != "IMAGE" or image.size[0] <= 0 or image.size[1] <= 0:
+            continue
+        texture_path = os.path.join(texture_dir, safe_texture_name(image.name, used))
+        try:
+            image.filepath_raw = texture_path
+            image.file_format = "PNG"
+            image.save()
+            verify_saved_texture(texture_path)
+        except Exception as exc:
+            try:
+                image.save_render(texture_path, scene=bpy.context.scene)
+                verify_saved_texture(texture_path)
+                print(f"REEXTRACTOR_TEXTURE_RECOVERED:{image.name}:{exc}", flush=True)
+            except Exception as fallback_exc:
+                print(f"REEXTRACTOR_TEXTURE_WARN:{image.name}:{exc}; fallback={fallback_exc}", flush=True)
+                continue
+        image.filepath = texture_path
+        image.filepath_raw = texture_path
+        saved += 1
+    print(f"REEXTRACTOR_TEXTURES:{saved}:{texture_dir}", flush=True)
+
+
+def verify_saved_texture(path):
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        raise RuntimeError(f"texture file was not written: {path}")
+    loaded = bpy.data.images.load(path, check_existing=False)
+    try:
+        if loaded.size[0] <= 0 or loaded.size[1] <= 0:
+            raise RuntimeError("saved PNG has invalid size")
+    finally:
+        bpy.data.images.remove(loaded)
+
+
+def is_bound_to_armature(obj, armature):
+    return obj.parent == armature or any(
+        modifier.type == "ARMATURE" and modifier.object == armature
+        for modifier in obj.modifiers
+    )
+
+
+def remove_unbound_meshes(armature, keep=None):
+    for obj in list(bpy.data.objects):
+        if obj.type != "MESH" or obj == keep:
+            continue
+        if is_bound_to_armature(obj, armature):
+            continue
+        mesh_data = obj.data
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if mesh_data.users == 0:
+            bpy.data.meshes.remove(mesh_data)
+
+
+def remove_meshes_except(keep):
+    for obj in list(bpy.data.objects):
+        if obj.type != "MESH" or obj == keep:
+            continue
+        mesh_data = obj.data
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if mesh_data.users == 0:
+            bpy.data.meshes.remove(mesh_data)
+
+
+def ensure_export_root(armature):
+    """Add a real identity Root bone without changing any source rest pose."""
+    if any(bone.name.casefold() == "root" for bone in armature.data.bones):
+        return False
+
+    bpy.ops.object.select_all(action="DESELECT")
+    armature.select_set(True)
+    bpy.context.view_layer.objects.active = armature
+    bpy.ops.object.mode_set(mode="EDIT")
+    try:
+        source_roots = [bone for bone in armature.data.edit_bones if bone.parent is None]
+        source_matrices = {bone.name: bone.matrix.copy() for bone in source_roots}
+        root = armature.data.edit_bones.new("root")
+        # A Blender bone pointing along +Y has an identity local orientation. Keeping
+        # this bone at identity is essential: UE must not inherit an FBX conversion
+        # node as its skeleton root.
+        root.head = (0.0, 0.0, 0.0)
+        root.tail = (0.0, 0.01, 0.0)
+        root.use_deform = False
+
+        for bone in source_roots:
+            bone.parent = root
+            bone.use_connect = False
+            # Parenting must not alter C_Hip (or any other source root) in armature
+            # space; this also keeps the existing skin bind matrices valid.
+            bone.matrix = source_matrices[bone.name]
+    finally:
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    print(f"REEXTRACTOR_ROOT_MODE:ADDED_BONE:{len(source_roots)}", flush=True)
+    return True
+
+
+source_dir, output_path = arguments()
+source_dir = os.path.abspath(source_dir)
+output_path = os.path.abspath(output_path)
+inputs = sorted(
+    os.path.join(source_dir, name)
+    for name in os.listdir(source_dir)
+    if name.lower().endswith(".glb")
+)
+if not inputs:
+    raise RuntimeError("没有可转换的 GLB 模型")
+
+clear_scene()
+scene = bpy.context.scene
+scene.render.fps = 60
+scene.render.fps_base = 1.0
+# FBX and UE use centimeters.  Keep the GLB skeleton/mesh data untouched so
+# its bind pose and axis orientation stay exactly as imported, then let the
+# FBX exporter convert the scene unit metadata rather than scaling any bones.
+scene.unit_settings.system = "METRIC"
+scene.unit_settings.scale_length = 0.01
+scene.unit_settings.length_unit = "CENTIMETERS"
+
+for source in inputs:
+    bpy.ops.import_scene.gltf(filepath=source, import_pack_images=True)
+
+# Character parts exported from separate .mesh files usually carry identical
+# armatures. Rebind them to one shared armature so DCC applications receive one
+# coherent character instead of a stack of duplicate skeletons.
+armatures = [obj for obj in bpy.data.objects if obj.type == "ARMATURE"]
+if armatures:
+    primary = armatures[0]
+    # UE's Blender importer intentionally removes an FBX skeleton container named
+    # exactly "Armature". Never rename that conversion node to Root: doing so makes UE
+    # retain its 90-degree axis transform and lays the character on its side.
+    primary.name = "Armature"
+    primary.data.name = "Armature"
+    primary_bones = {bone.name for bone in primary.data.bones}
+    for duplicate in armatures[1:]:
+        if {bone.name for bone in duplicate.data.bones} != primary_bones:
+            continue
+        for obj in bpy.data.objects:
+            if obj.parent == duplicate:
+                world = obj.matrix_world.copy()
+                obj.parent = primary
+                obj.matrix_world = world
+            for modifier in obj.modifiers:
+                if modifier.type == "ARMATURE" and modifier.object == duplicate:
+                    modifier.object = primary
+        bpy.data.objects.remove(duplicate, do_unlink=True)
+    armatures = [primary]
+    if not ensure_export_root(primary):
+        print("REEXTRACTOR_ROOT_MODE:EXPLICIT", flush=True)
+
+# Drop glTF helper/bone-shape meshes before joining. They are not skinned to the
+# character armature and can otherwise reappear in FBX/UE as a stray Cube mesh.
+if armatures:
+    primary = armatures[0]
+    remove_unbound_meshes(primary)
+
+# UE treats every FBX mesh object as a separate skeletal/static mesh candidate. Keep all
+# material slots and vertex groups, but physically join every imported part into one object.
+mesh_objects = [obj for obj in bpy.data.objects if obj.type == "MESH"]
+if mesh_objects:
+    bpy.ops.object.select_all(action="DESELECT")
+    for obj in mesh_objects:
+        obj.select_set(True)
+    bpy.context.view_layer.objects.active = mesh_objects[0]
+    if len(mesh_objects) > 1:
+        bpy.ops.object.join()
+    merged_mesh = bpy.context.view_layer.objects.active
+    export_name = os.path.splitext(os.path.basename(output_path))[0]
+    merged_mesh.name = export_name
+    merged_mesh.data.name = export_name
+    if armatures:
+        merged_mesh.parent = armatures[0]
+
+# Export only the unified skeleton and unified mesh. Imported helper empties or bone-shape
+# geometry must not become extra UE assets.
+if armatures:
+    primary = armatures[0]
+    remove_unbound_meshes(primary)
+    mesh_objects = [obj for obj in bpy.data.objects if obj.type == "MESH"]
+    if len(mesh_objects) != 1:
+        raise RuntimeError(f"模型 FBX 导出前应只剩 1 个蒙皮网格，当前 {len(mesh_objects)} 个")
+
+if mesh_objects:
+    merged_mesh = mesh_objects[0]
+    remove_meshes_except(merged_mesh)
+
+bpy.ops.object.select_all(action="DESELECT")
+if armatures:
+    armatures[0].select_set(True)
+if mesh_objects:
+    merged_mesh.select_set(True)
+    bpy.context.view_layer.objects.active = merged_mesh
+
+prepare_export_axes()
+unpack_pbr_channels_for_fbx()
+save_external_textures(output_path)
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+bpy.ops.export_scene.fbx(
+    filepath=output_path,
+    use_selection=True,
+    object_types={"ARMATURE", "MESH", "EMPTY"},
+    bake_anim=False,
+    add_leaf_bones=False,
+    global_scale=1.0,
+    apply_unit_scale=True,
+    apply_scale_options="FBX_SCALE_NONE",
+    **axis_options(),
+    primary_bone_axis="Z",
+    secondary_bone_axis="X",
+    use_armature_deform_only=True,
+    armature_nodetype="NULL",
+    path_mode="RELATIVE",
+    embed_textures=False,
+)
+print(f"REEXTRACTOR_OK:{output_path}")

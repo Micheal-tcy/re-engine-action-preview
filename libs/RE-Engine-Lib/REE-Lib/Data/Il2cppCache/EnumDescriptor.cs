@@ -1,0 +1,345 @@
+namespace ReeLib.Il2cpp;
+
+using System.Numerics;
+using System.Text.Json;
+using ReeLib;
+using ReeLib.Common;
+
+public abstract class EnumDescriptor
+{
+    public abstract Type BackingType { get; }
+
+    public abstract IEnumerable<EnumCacheItem> CacheItems { get; }
+    protected abstract IEnumerable<string> LabelValuePairs { get; }
+    private string? _hintstring;
+    public string HintstringLabels => _hintstring ??= string.Join(",", LabelValuePairs);
+
+    protected static readonly Dictionary<Type, ulong> MaskBitsDict = new Dictionary<Type, ulong>() {
+        { typeof(long), ulong.MaxValue },
+        { typeof(ulong), ulong.MaxValue },
+        { typeof(int), uint.MaxValue },
+        { typeof(uint), uint.MaxValue },
+        { typeof(ushort), ushort.MaxValue },
+        { typeof(short), ushort.MaxValue },
+        { typeof(byte), byte.MaxValue },
+        { typeof(sbyte), byte.MaxValue },
+    };
+
+    protected static bool _useSafeValueConverter;
+
+    public bool IsEmpty => !CacheItems.Any();
+    public bool IsFlags { get; set; }
+    public bool IsCustom { get; set; }
+
+    public abstract string GetLabel(object value);
+    public abstract string GetDisplayLabel(object value);
+    public abstract string GetLabel(JsonElement value);
+    public abstract string[] GetLabels();
+    public abstract string[] GetDisplayLabels();
+    public abstract object[] GetValues();
+
+    public abstract bool HasFlag(object number, object flag);
+    public abstract object AddFlag(object number, object flag);
+    public abstract object RemoveFlag(object number, object flag);
+
+    public void ParseIl2cppData(ObjectDef item)
+    {
+        if (item.fields == null) return;
+
+        foreach (var (name, field) in item.fields.OrderBy(f => f.Value.Id)) {
+            if (!field.Flags.Contains("SpecialName") && field.IsStatic && field.Default is JsonElement elem && elem.ValueKind == JsonValueKind.Number) {
+                AddValue(name, elem);
+            }
+        }
+
+        IsFlags = GuessIsFlags();
+    }
+
+    public void SetupValues(TypeCache.EnumsInternalMetadata valueDict)
+    {
+        foreach (var (k, v) in valueDict.Entries) {
+            AddValue(k, v);
+        }
+
+        IsFlags = valueDict.IsConfirmedFlags || GuessIsFlags();
+    }
+
+    public void ParseCacheData(IEnumerable<EnumCacheItem> pairs)
+    {
+        foreach (var item in pairs) {
+            AddValue(item.name, item.value);
+        }
+    }
+
+    public void ParseCacheData(SignedEnumItem[] pairs)
+    {
+        foreach (var item in pairs) {
+            AddValue(item.Name, JsonSerializer.SerializeToElement(item.Value));
+        }
+    }
+
+    protected abstract bool GuessIsFlags();
+    public abstract void AddValue(string name, JsonElement elem);
+    public void AddValue<T>(T value, string name, string? displayName = null) where T : IBinaryInteger<T>
+    {
+        var valueElement = JsonSerializer.SerializeToElement(Convert.ChangeType(value, BackingType));
+        AddValue(name, valueElement);
+        if (displayName != null) {
+            SetDisplayLabel(valueElement, displayName);
+        }
+    }
+
+    public abstract void ClearDisplayLabels();
+    public abstract void SetDisplayLabel(JsonElement value, string name);
+    public abstract void SetDisplayLabels(IEnumerable<KeyValuePair<JsonElement, string>> labels);
+    public abstract void SetDisplayLabel(string label, string name);
+    public abstract void SetDisplayLabels(IEnumerable<KeyValuePair<string, string>> labels);
+
+    internal static void EnableSafeIl2cppValueConverter(bool safeMode)
+    {
+        foreach (var type in MaskBitsDict.Keys) {
+            var descType = typeof(EnumDescriptor<>).MakeGenericType(type);
+            descType
+                .GetMethod(nameof(EnumDescriptor<>.ResetConverter), System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Static)!
+                .Invoke(null, []);
+        }
+        _useSafeValueConverter = safeMode;
+    }
+}
+
+public sealed class EnumDescriptor<T> : EnumDescriptor where T : struct, IBinaryInteger<T>, IBitwiseOperators<T, T, T>, IMinMaxValue<T>, ISubtractionOperators<T, T, T>
+{
+    public readonly Dictionary<T, string> ValueToLabels = new();
+    public readonly Dictionary<T, string> ValueToDisplayLabels = new();
+    private readonly List<KeyValuePair<string, T>> OrderedValues = new();
+    public readonly Dictionary<string, T> LabelToValues = new();
+
+    // need to use Convert.ChangeType because we aren't always getting the same type (e.g. rsz says uint, enum say int)
+    public override bool HasFlag(object number, object flag) => ((T)Convert.ChangeType(number, typeof(T)) & (T)flag) != T.Zero;
+    public override object AddFlag(object number, object flag) => Convert.ChangeType(((T)Convert.ChangeType(number, typeof(T)) | (T)flag), number.GetType());
+    public override object RemoveFlag(object number, object flag) => Convert.ChangeType(((T)Convert.ChangeType(number, typeof(T)) & (~(T)flag)), number.GetType());
+
+    public override Type BackingType => typeof(T);
+    public override IEnumerable<EnumCacheItem> CacheItems => ValueToLabels
+        .Select((pair) => new EnumCacheItem(pair.Value, JsonSerializer.SerializeToElement(pair.Key)));
+
+    public static readonly EnumDescriptor<T> Default = new();
+    private static readonly object DefaultValue = default(T);
+
+    private static ulong MaskBits => MaskBitsDict[typeof(T)];
+
+    public override string GetLabel(object value) => ValueToLabels.TryGetValue((T)value, out var val) ? val : string.Empty;
+    public override string GetDisplayLabel(object value) => ValueToDisplayLabels.TryGetValue((T)value, out var val) ? val : ValueToLabels.TryGetValue((T)value, out val) ? val : string.Empty;
+    public override string GetLabel(JsonElement value) => GetLabel(Converter(value));
+
+    private string[]? _labelsArray;
+    public override string[] GetLabels()
+    {
+        if (_labelsArray == null) {
+            _labelsArray = OrderedValues.Select(kv => kv.Key).ToArray();
+        }
+        return _labelsArray;
+    }
+
+    private object[]? _valuesArray;
+    public override object[] GetValues()
+    {
+        if (_valuesArray == null) {
+            _valuesArray = OrderedValues.Select(kv => (object)kv.Value).ToArray();
+        }
+        return _valuesArray;
+    }
+
+    private string[]? _displayLabelsArray;
+    public override string[] GetDisplayLabels()
+    {
+        if (_displayLabelsArray == null) {
+            _displayLabelsArray = OrderedValues
+                .Select(kv => ValueToDisplayLabels.TryGetValue(kv.Value, out var display) ? display : kv.Key)
+                .ToArray();
+        }
+        return _displayLabelsArray;
+    }
+
+    private static Func<JsonElement, T>? converter;
+    private static Func<JsonElement, T> Converter {
+        get {
+            if (converter == null) CreateConverter();
+            return converter!;
+        }
+    }
+
+    protected override IEnumerable<string> LabelValuePairs => ValueToLabels.Select((pair) => $"{pair.Value.Replace(":", "-")}:{pair.Key}");
+
+    internal static void ResetConverter() => converter = null;
+
+    protected override bool GuessIsFlags()
+    {
+        if (!ValueToLabels.ContainsKey(T.One) || !ValueToLabels.ContainsKey(T.One + T.One)) {
+            return false;
+        }
+        var values = ValueToLabels.Keys.Order().ToArray();
+        T previous = values.First();
+        var isSequential = true;
+        foreach (var v in values.Skip(1)) {
+            if (v == -T.One) continue;
+            if (v == previous + T.One) {
+                previous = v;
+            } else {
+                isSequential = false;
+                break;
+            }
+        }
+        if (isSequential) return false;
+        var pots = values.Where(v => T.IsPow2(v));
+        var maxPot = pots.LastOrDefault();
+        if (maxPot == T.Zero) return false;
+        var all = default(T);
+        foreach (var pot in pots) all += pot;
+
+        var potCount = pots.Count();
+        var max = values.Last();
+        if (max > all) return false;
+
+        foreach (var nonpot in values.Where(n => !T.IsPow2(n))) {
+            if ((nonpot & ~all) != T.Zero) return false;
+        }
+        return max != maxPot && potCount >= 2 || potCount >= 3;
+    }
+
+    public override void AddValue(string name, JsonElement elem)
+    {
+        if (converter == null) {
+            CreateConverter();
+        }
+        T val = converter!(elem);
+        if (ValueToLabels.TryGetValue(val, out var prevName)) {
+            if (prevName == name) {
+                return;
+            }
+            LabelToValues.Remove(prevName);
+            var prevPair = new KeyValuePair<string, T>(prevName, val);
+            var index = OrderedValues.IndexOf(prevPair);
+            if (index == -1) {
+                OrderedValues.Add(new KeyValuePair<string, T>(name, val));
+            } else {
+                OrderedValues[index] = new KeyValuePair<string, T>(name, val);
+            }
+        } else {
+            OrderedValues.Add(new KeyValuePair<string, T>(name, val));
+        }
+        ValueToLabels[val] = name;
+        LabelToValues[name] = val;
+        _labelsArray = null;
+        _valuesArray = null;
+        _displayLabelsArray = null;
+    }
+
+    private static T CreateSafeSignedConverter(JsonElement e)
+    {
+        try {
+            return (T)Convert.ChangeType(e.GetInt64(), typeof(T));
+        } catch {
+            // need to separately handle some cases - raw REF il2cpp dump always prints as unsigned, whereas we're storing them with correct sign in the cache
+            // starting with pragmata, some S32 enums even get dumped as U64 so we need to also hack the extra bits away
+            try {
+                return (T)Convert.ChangeType((long)((ulong)e.GetInt64() & MaskBits), typeof(T));
+            } catch {
+                var val = e.GetUInt64() & MaskBits;
+                if (val.CompareTo(Convert.ToUInt64(T.MaxValue)) > 0) {
+                    var valueBits = unchecked(MaskBits >> 1);
+                    return (T)Convert.ChangeType(val & valueBits, typeof(T)) | T.MinValue;
+                } else {
+                    return (T)Convert.ChangeType((long)val, typeof(T));
+                }
+            }
+        }
+    }
+
+    private static T CreateSafeUnsignedConverter(JsonElement e)
+    {
+        try {
+            return (T)Convert.ChangeType(e.GetUInt64() & MaskBits, typeof(T));
+        } catch {
+            return (T)Convert.ChangeType(((ulong)e.GetInt64()) & MaskBits, typeof(T));
+        }
+    }
+
+    private static void CreateConverter()
+    {
+        if (_useSafeValueConverter) {
+            if (typeof(T) == typeof(System.Int64) || typeof(T) == typeof(System.Int32) || typeof(T) == typeof(System.Int16) || typeof(T) == typeof(System.SByte))
+                converter = CreateSafeSignedConverter;
+            else
+                converter = CreateSafeUnsignedConverter;
+            return;
+        }
+
+        // prioritize performance for normal runtime, no extra hacks needed
+        if (typeof(T) == typeof(System.Int64)) {
+            converter = static (e) => (T)(object)(long)e.GetInt64();
+        } else if (typeof(T) == typeof(System.UInt64)) {
+            converter = static (e) => (T)(object)(ulong)e.GetUInt64();
+        } else if (typeof(T) == typeof(System.Int32)) {
+            converter = static (e) => (T)(object)(int)e.GetInt64();
+        } else if (typeof(T) == typeof(System.UInt32)) {
+            converter = static (e) => (T)(object)(uint)e.GetUInt32();
+        } else if (typeof(T) == typeof(System.Int16)) {
+            converter = static (e) => (T)(object)(short)e.GetInt32();
+        } else if (typeof(T) == typeof(System.UInt16)) {
+            converter = static (e) => (T)(object)(ushort)e.GetUInt16();
+        } else if (typeof(T) == typeof(System.SByte)) {
+            converter = static (e) => (T)(object)(sbyte)e.GetInt32();
+        } else if (typeof(T) == typeof(System.Byte)) {
+            converter = static (e) => (T)(object)(byte)e.GetInt32();
+        } else {
+            converter = static (e) => default(T);
+        }
+    }
+
+    public override void ClearDisplayLabels()
+    {
+        _displayLabelsArray = null;
+        ValueToDisplayLabels.Clear();
+    }
+
+    public override void SetDisplayLabel(JsonElement value, string name)
+    {
+        _displayLabelsArray = null;
+        if (converter == null) {
+            CreateConverter();
+        }
+        T val = converter!(value);
+        ValueToDisplayLabels[val] = name;
+    }
+
+    public override void SetDisplayLabels(IEnumerable<KeyValuePair<JsonElement, string>> labels)
+    {
+        _displayLabelsArray = null;
+        if (converter == null) {
+            CreateConverter();
+        }
+        foreach (var (key, label) in labels) {
+            T val = converter!(key);
+            ValueToDisplayLabels[val] = label;
+        }
+    }
+
+    public override void SetDisplayLabel(string label, string displayLabel)
+    {
+        if (!LabelToValues.TryGetValue(label, out var value)) {
+            return;
+        }
+        ValueToDisplayLabels[value] = displayLabel;
+    }
+
+    public override void SetDisplayLabels(IEnumerable<KeyValuePair<string, string>> labels)
+    {
+        foreach (var (label, displayLabel) in labels) {
+            if (!LabelToValues.TryGetValue(label, out var value)) {
+                continue;
+            }
+            ValueToDisplayLabels[value] = displayLabel;
+        }
+    }
+}

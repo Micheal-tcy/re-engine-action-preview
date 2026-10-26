@@ -1,0 +1,165 @@
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+using ReeLib.Common;
+
+namespace ReeLib;
+
+public sealed partial class FileExtensionCache
+{
+    public Dictionary<string, int> Versions { get; set; }
+    [JsonIgnore]
+    public Dictionary<string, FileExtensionInfo> Info {
+        get {
+            if (!hasResolvedFormats) {
+                ResolveFileFormats();
+                hasResolvedFormats = true;
+            }
+            return _info;
+        }
+    }
+
+    [JsonInclude, JsonPropertyName("Info")]
+    private Dictionary<string, FileExtensionInfo> _info;
+
+    private bool hasResolvedFormats;
+
+    public FileExtensionCache()
+    {
+        Versions = new();
+        _info = new();
+    }
+
+    public FileExtensionCache(Dictionary<string, int> versions)
+    {
+        Versions = versions;
+        _info = versions.ToDictionary(k => k.Key, v => new FileExtensionInfo() { Version = v.Value });
+    }
+
+    public FileExtensionCache(Dictionary<string, FileExtensionInfo> info)
+    {
+        _info = info;
+        Versions = info.ToDictionary(k => k.Key, v => v.Value.Version);
+    }
+
+    // locale can be en, pt, ptbr, es, es419, zhcn, zhtw, ...
+    [GeneratedRegex("\\.(?:x64|stm)\\.([a-z]{2}[a-zA-Z0-9]*)$")]
+    private static partial Regex IsLocalizedFileRegex();
+
+    [GeneratedRegex("\\.(?:\\d+)\\.([a-z]{2}[a-zA-Z0-9]*)$")]
+    private static partial Regex IsLocalizedNonPlatformFileRegex();
+
+    public void HandleFilepathsFromList(string listFilepath)
+    {
+        if (!File.Exists(listFilepath)) {
+            throw new Exception($"List file '{listFilepath}' not found");
+        }
+        using var file = new StreamReader(File.OpenRead(listFilepath));
+        while (!file.EndOfStream) {
+            var line = file.ReadLine();
+            if (string.IsNullOrWhiteSpace(line)) continue;
+
+            HandleFilepath(line);
+        }
+        foreach (var ext in _info) {
+            Versions[ext.Key] = ext.Value.Version;
+        }
+    }
+
+    public void HandleFilepath(string filepath)
+    {
+        filepath = filepath.ToLowerInvariant();
+        var isLocalized = false;
+        string? locale = null;
+        var hasStm = false;
+        var hasX64 = false;
+        if (IsLocalizedFileRegex().IsMatch(filepath)) {
+            if (filepath.Contains(".x64.")) {
+                hasX64 = true;
+            } else {
+                hasStm = true;
+            }
+            isLocalized = true;
+            locale = IsLocalizedFileRegex().Match(filepath).Groups[1].Value;
+            filepath = Path.GetFileNameWithoutExtension(Path.GetFileNameWithoutExtension(filepath));
+        } else if (IsLocalizedNonPlatformFileRegex().IsMatch(filepath)) {
+            isLocalized = true;
+            locale = IsLocalizedNonPlatformFileRegex().Match(filepath).Groups[1].Value;
+            filepath = Path.GetFileNameWithoutExtension(filepath);
+        } else if (filepath.EndsWith(".x64")) {
+            hasX64 = true;
+            filepath = Path.GetFileNameWithoutExtension(filepath);
+        } else if (filepath.EndsWith(".stm")) {
+            hasStm = true;
+            filepath = Path.GetFileNameWithoutExtension(filepath);
+        }
+
+        var versionStr = Path.GetExtension(filepath).Replace(".", "");
+        var ext = Path.GetExtension(Path.GetFileNameWithoutExtension(filepath)).Replace(".", "");
+        if (!string.IsNullOrEmpty(ext)) {
+            if (!_info.TryGetValue(ext, out var info)) {
+                _info[ext] = info = new FileExtensionInfo();
+            }
+
+            info.CanHaveX64 = hasX64 || info.CanHaveX64;
+            info.CanHaveStm = hasStm || info.CanHaveStm;
+            info.CanNotHaveX64 = !hasX64 && !hasStm || info.CanNotHaveX64;
+            info.CanHaveLang = isLocalized || info.CanHaveLang;
+            info.CanNotHaveLang = !isLocalized || info.CanNotHaveLang;
+
+            if (locale != null && !info.Locales.Contains(locale)) {
+                if (locale == "en") {
+                    info.Locales.Insert(0, locale);
+                } else {
+                    info.Locales.Add(locale);
+                }
+            }
+            if (int.TryParse(versionStr, out var version)) {
+                if (info.Version != 0 && info.Version != version) {
+                    Log.Error($"Warning: updating .{ext} file version from {info.Version} to {version}");
+                }
+                info.Version = version;
+            }
+        }
+    }
+
+    private void ResolveFileFormats()
+    {
+        foreach (var (k, v) in _info) {
+            v.Type = FileFormatExtensions.ExtensionToEnum(k);
+        }
+    }
+
+    private static readonly Dictionary<KnownFileFormats, KnownFileFormats[]> formatRootToSubTypes = new () {
+        [KnownFileFormats.Texture] = [KnownFileFormats.Texture, KnownFileFormats.RenderTexture],
+        [KnownFileFormats.TimelineBase] = [KnownFileFormats.Timeline, KnownFileFormats.Clip, KnownFileFormats.UserCurve, KnownFileFormats.DialogueTimeline],
+        [KnownFileFormats.MotionBase] = [KnownFileFormats.Motion, KnownFileFormats.MotionList, KnownFileFormats.GpuMotionList, ReeLib.KnownFileFormats.MotionCamera, KnownFileFormats.MotionCameraList],
+        [KnownFileFormats.DynamicsBase] = [KnownFileFormats.HeightField, KnownFileFormats.RigidBodyMesh],
+        [KnownFileFormats.BehaviorTreeBase] = [KnownFileFormats.BehaviorTree, KnownFileFormats.Fsm2],
+        [KnownFileFormats.Skeleton] = [KnownFileFormats.Skeleton, KnownFileFormats.RefSkeleton, KnownFileFormats.FbxSkeleton],
+        [KnownFileFormats.RigidBodySet] = [KnownFileFormats.RigidBodySet, KnownFileFormats.Ragdoll],
+    };
+
+    private static readonly Dictionary<KnownFileFormats, KnownFileFormats[]> formatSubTypes = new (formatRootToSubTypes) {
+        [KnownFileFormats.Clip] = [KnownFileFormats.Clip, KnownFileFormats.UserCurve, KnownFileFormats.DialogueTimeline],
+    };
+
+    private static readonly Dictionary<KnownFileFormats, KnownFileFormats> formatBaseTypes = formatRootToSubTypes
+        .SelectMany(kv => kv.Value.Select(sub => (sub, root: kv.Key)))
+        .ToDictionary(subKey => subKey.sub, subKey => subKey.root);
+
+    public static KnownFileFormats[]? GetFormatSubTypes(KnownFileFormats format) => formatSubTypes.GetValueOrDefault(format);
+    public static KnownFileFormats GetFormatRootType(KnownFileFormats format) => formatBaseTypes.GetValueOrDefault(format, format);
+
+    public sealed class FileExtensionInfo
+    {
+        public List<string> Locales { get; set; } = new();
+        [JsonIgnore] public KnownFileFormats Type { get; set; } = KnownFileFormats.Unknown;
+        public int Version { get; set; }
+        public bool CanHaveX64 { get; set; }
+        public bool CanHaveStm { get; set; }
+        public bool CanNotHaveX64 { get; set; }
+        public bool CanHaveLang { get; set; }
+        public bool CanNotHaveLang { get; set; }
+    }
+}
+
